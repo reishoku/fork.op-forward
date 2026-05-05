@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ekovshilovsky/op-forward/internal/auth"
+	"github.com/reishoku/fork.op-forward/internal/auth"
 )
 
 func TestProxyTokenPathUsesXDGStateHome(t *testing.T) {

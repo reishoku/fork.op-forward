@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [reishoku]
   pull_request:
-    branches: [main]
+    branches: [reishoku]
 
 jobs:
   test:

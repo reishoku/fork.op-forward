@@ -39,7 +39,7 @@ Section: utils
 Priority: optional
 Architecture: ${DEB_ARCH}
 Maintainer: Eugene Kovshilovsky <ekovshilovsky@users.noreply.github.com>
-Homepage: https://github.com/ekovshilovsky/op-forward
+Homepage: https://github.com/reishoku/fork.op-forward
 Description: Forward 1Password CLI across SSH boundaries with biometric auth
  op-forward runs a daemon on the host and installs a transparent op shim on the
  remote side so that 1Password CLI commands inside VMs are forwarded to the host

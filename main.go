@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ekovshilovsky/op-forward/cmd"
+	"github.com/reishoku/fork.op-forward/cmd"
 )
 
 func main() {

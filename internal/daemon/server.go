@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ekovshilovsky/op-forward/internal/auth"
-	"github.com/ekovshilovsky/op-forward/internal/executor"
-	"github.com/ekovshilovsky/op-forward/internal/transport"
-	"github.com/ekovshilovsky/op-forward/internal/version"
+	"github.com/reishoku/fork.op-forward/internal/auth"
+	"github.com/reishoku/fork.op-forward/internal/executor"
+	"github.com/reishoku/fork.op-forward/internal/transport"
+	"github.com/reishoku/fork.op-forward/internal/version"
 )
 
 // MinClientVersion is the oldest client version the daemon will accept.

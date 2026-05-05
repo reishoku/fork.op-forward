@@ -1,4 +1,4 @@
-module github.com/ekovshilovsky/op-forward
+module github.com/reishoku/fork.op-forward
 
 go 1.25.0
 

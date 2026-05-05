@@ -1,6 +1,6 @@
 VERSION ?= 0.3.0
 BINARY  := op-forward
-LDFLAGS := -s -w -X github.com/ekovshilovsky/op-forward/cmd.Version=$(VERSION)
+LDFLAGS := -s -w -X github.com/reishoku/fork.op-forward/cmd.Version=$(VERSION)
 
 .PHONY: build build-all clean test
 

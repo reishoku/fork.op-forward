@@ -2,9 +2,9 @@
 set -e
 
 # op-forward installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/ekovshilovsky/op-forward/main/scripts/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/reishoku/fork.op-forward/reishoku/scripts/install.sh | sh
 
-REPO="ekovshilovsky/op-forward"
+REPO="reishoku/fork.op-forward"
 INSTALL_DIR="${OP_FORWARD_INSTALL_DIR:-$HOME/.local/bin}"
 
 detect_platform() {

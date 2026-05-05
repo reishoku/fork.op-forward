@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	githubOwner = "ekovshilovsky"
-	githubRepo  = "op-forward"
+	githubOwner = "reishoku"
+	githubRepo  = "fork.op-forward"
 )
 
 type githubRelease struct {

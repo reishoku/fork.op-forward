@@ -1,10 +1,10 @@
 # op-forward
 
-[![CI](https://github.com/ekovshilovsky/op-forward/actions/workflows/ci.yml/badge.svg)](https://github.com/ekovshilovsky/op-forward/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/ekovshilovsky/op-forward)](https://github.com/ekovshilovsky/op-forward/releases/latest)
-[![Go Report Card](https://goreportcard.com/badge/github.com/ekovshilovsky/op-forward)](https://goreportcard.com/report/github.com/ekovshilovsky/op-forward)
+[![CI](https://github.com/reishoku/fork.op-forward/actions/workflows/ci.yml/badge.svg)](https://github.com/reishoku/fork.op-forward/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/reishoku/fork.op-forward)](https://github.com/reishoku/fork.op-forward/releases/latest)
+[![Go Report Card](https://goreportcard.com/badge/github.com/reishoku/fork.op-forward)](https://goreportcard.com/report/github.com/reishoku/fork.op-forward)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/ekovshilovsky/op-forward)](go.mod)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/reishoku/fork.op-forward)](go.mod)
 
 Forward 1Password CLI (`op`) commands across SSH boundaries with biometric authentication.
 
@@ -29,20 +29,20 @@ The developer experience is transparent: run `op account list` or `op item get <
 Via Homebrew:
 
 ```bash
-brew install ekovshilovsky/tap/op-forward
+brew install reishoku/tap/op-forward
 ```
 
 Via the install script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ekovshilovsky/op-forward/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/reishoku/fork.op-forward/reishoku/scripts/install.sh | sh
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/ekovshilovsky/op-forward.git
-cd op-forward
+git clone https://github.com/reishoku/fork.op-forward.git
+cd fork.op-forward
 go build -ldflags="-s -w" -o op-forward .
 cp op-forward ~/.local/bin/
 ```
@@ -65,8 +65,8 @@ Via APT (Ubuntu/Debian — recommended for VMs):
 
 ```bash
 # Add the repository signing key and source
-curl -fsSL https://ekovshilovsky.github.io/op-forward/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/op-forward.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://ekovshilovsky.github.io/op-forward stable main" | sudo tee /etc/apt/sources.list.d/op-forward.list
+curl -fsSL https://reishoku.github.io/fork.op-forward/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/op-forward.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://reishoku.github.io/fork.op-forward stable main" | sudo tee /etc/apt/sources.list.d/op-forward.list
 sudo apt-get update
 sudo apt-get install op-forward
 
@@ -80,7 +80,7 @@ Via manual download:
 
 ```bash
 # Download the latest release for your architecture
-curl -fsSL https://github.com/ekovshilovsky/op-forward/releases/latest/download/op-forward_$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/').tar.gz | tar -xz -C ~/.local/bin/
+curl -fsSL https://github.com/reishoku/fork.op-forward/releases/latest/download/op-forward_$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/').tar.gz | tar -xz -C ~/.local/bin/
 
 # Install the op shim
 op-forward install
@@ -188,7 +188,7 @@ This downloads the latest binary from GitHub Releases for your platform, replace
 If installed via Homebrew:
 
 ```bash
-brew upgrade ekovshilovsky/tap/op-forward
+brew upgrade reishoku/tap/op-forward
 ```
 
 The Homebrew formula is updated automatically on each release.
