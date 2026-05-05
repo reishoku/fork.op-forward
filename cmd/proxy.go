@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/op-forward/internal/auth"
-	"github.com/ekovshilovsky/op-forward/internal/executor"
-	"github.com/ekovshilovsky/op-forward/internal/transport"
+	"github.com/reishoku/fork.op-forward/internal/auth"
+	"github.com/reishoku/fork.op-forward/internal/executor"
+	"github.com/reishoku/fork.op-forward/internal/transport"
 )
 
 // proxyExitInfraFailure is the exit code the proxy uses to signal that

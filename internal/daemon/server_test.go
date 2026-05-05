@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ekovshilovsky/op-forward/internal/auth"
-	"github.com/ekovshilovsky/op-forward/internal/executor"
+	"github.com/reishoku/fork.op-forward/internal/auth"
+	"github.com/reishoku/fork.op-forward/internal/executor"
 )
 
 func newTestServer(t *testing.T) (*Server, string, string) {

@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ekovshilovsky/op-forward/internal/transport"
+	"github.com/reishoku/fork.op-forward/internal/transport"
 
-	"github.com/ekovshilovsky/op-forward/internal/auth"
-	"github.com/ekovshilovsky/op-forward/internal/daemon"
+	"github.com/reishoku/fork.op-forward/internal/auth"
+	"github.com/reishoku/fork.op-forward/internal/daemon"
 )
 
 func runServe() error {

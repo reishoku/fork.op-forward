@@ -33,7 +33,7 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           VERSION="${TAG_NAME#v}"
-          LDFLAGS="-s -w -X github.com/ekovshilovsky/op-forward/cmd.Version=${VERSION}"
+          LDFLAGS="-s -w -X github.com/reishoku/fork.op-forward/cmd.Version=${VERSION}"
           for PAIR in "linux amd64" "linux arm64" "darwin amd64" "darwin arm64"; do
             OS=$(echo "$PAIR" | cut -d' ' -f1)
             ARCH=$(echo "$PAIR" | cut -d' ' -f2)
@@ -68,26 +68,26 @@ jobs:
           cat > "${FORMULA_PATH}" <<FORMULA_EOF
           class OpForward < Formula
             desc "Forward 1Password CLI across SSH boundaries with biometric auth"
-            homepage "https://github.com/ekovshilovsky/op-forward"
+            homepage "https://github.com/reishoku/fork.op-forward"
             version "${VERSION}"
             license "MIT"
 
             on_macos do
               if Hardware::CPU.arm?
-                url "https://github.com/ekovshilovsky/op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_darwin_arm64.tar.gz"
+                url "https://github.com/reishoku/fork.op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_darwin_arm64.tar.gz"
                 sha256 "${SHA_DARWIN_ARM64}"
               else
-                url "https://github.com/ekovshilovsky/op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_darwin_amd64.tar.gz"
+                url "https://github.com/reishoku/fork.op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_darwin_amd64.tar.gz"
                 sha256 "${SHA_DARWIN_AMD64}"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "https://github.com/ekovshilovsky/op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_linux_arm64.tar.gz"
+                url "https://github.com/reishoku/fork.op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_linux_arm64.tar.gz"
                 sha256 "${SHA_LINUX_ARM64}"
               else
-                url "https://github.com/ekovshilovsky/op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_linux_amd64.tar.gz"
+                url "https://github.com/reishoku/fork.op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_linux_amd64.tar.gz"
                 sha256 "${SHA_LINUX_AMD64}"
               end
             end
@@ -102,7 +102,7 @@ jobs:
           end
           FORMULA_EOF
 
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/ekovshilovsky/homebrew-tap.git" "${TAP_DIR}"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/reishoku/homebrew-tap.git" "${TAP_DIR}"
           cp "${FORMULA_PATH}" "${TAP_DIR}/Formula/op-forward.rb"
           cd "${TAP_DIR}"
           git config user.name "github-actions[bot]"
@@ -137,7 +137,7 @@ jobs:
           # Clone or initialize the gh-pages branch for the APT repo
           if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
             git clone --branch gh-pages --single-branch \
-              "https://x-access-token:${GH_TOKEN}@github.com/ekovshilovsky/op-forward.git" "${APT_REPO}"
+              "https://x-access-token:${GH_TOKEN}@github.com/reishoku/fork.op-forward.git" "${APT_REPO}"
           else
             mkdir -p "${APT_REPO}"
             cd "${APT_REPO}"
@@ -161,8 +161,8 @@ jobs:
           <h1>op-forward APT Repository</h1>
           <pre>
           # Add the repository
-          curl -fsSL https://ekovshilovsky.github.io/op-forward/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/op-forward.gpg
-          echo "deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://ekovshilovsky.github.io/op-forward stable main" | sudo tee /etc/apt/sources.list.d/op-forward.list
+          curl -fsSL https://reishoku.github.io/fork.op-forward/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/op-forward.gpg
+          echo "deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://reishoku.github.io/fork.op-forward stable main" | sudo tee /etc/apt/sources.list.d/op-forward.list
           sudo apt-get update
           sudo apt-get install op-forward
           </pre>
@@ -179,6 +179,6 @@ jobs:
           if git remote | grep -q origin; then
             git push origin gh-pages
           else
-            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/ekovshilovsky/op-forward.git"
+            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/reishoku/fork.op-forward.git"
             git push -u origin gh-pages
           fi

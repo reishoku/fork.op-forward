@@ -7,7 +7,7 @@ import (
 
 // Version is set at build time via ldflags:
 //
-//	go build -ldflags="-X github.com/ekovshilovsky/op-forward/cmd.Version=0.3.0"
+//	go build -ldflags="-X github.com/reishoku/fork.op-forward/cmd.Version=0.3.0"
 var Version = "dev"
 
 func Execute() error {
