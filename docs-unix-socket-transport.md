@@ -13,6 +13,15 @@ Current loopback TCP+HTTP transport relies on bearer tokens and SSH remote port 
 - On request handling, deny mismatched UID with `403 Forbidden`.
 - Keep official SDK/stdlib only (`net`, `net/http`, `syscall`, `path/filepath`) and no extra dependencies.
 - Path traversal countermeasure (CWE-22): token persistence uses Go's traversal-resistant `os.Root` API (`os.OpenRoot` + `Root.ReadFile`/`Root.WriteFile`/`Root.Rename`) so token file operations are constrained to the configured token directory even in the presence of symlinks and `..` components.
+- Directory precedence:
+  - Socket path: `OP_FORWARD_SOCKET_PATH` → `$XDG_RUNTIME_DIR/op-forward.sock` (if set) → OS cache dir (`os.UserCacheDir`) + `op-forward/op-forward.sock`.
+  - Token directory: `OP_FORWARD_TOKEN_DIR` → `$XDG_STATE_HOME/op-forward` (if set) → OS cache dir (`os.UserCacheDir`) + `op-forward`.
+
+## Environment validation and fallback
+- `XDG_RUNTIME_DIR` is ideal for Unix sockets on Linux because the XDG spec requires it to be user-owned, mode `0700`, and local filesystem.
+- `XDG_RUNTIME_DIR` is not guaranteed to exist (e.g., non-systemd sessions, some CI, many macOS shells). Fallback therefore remains required.
+- `XDG_STATE_HOME` is intended for persistent, user-specific state; if unset, XDG default is `$HOME/.local/state`.
+- On macOS, XDG variables are usually unset by default; `os.UserCacheDir` provides stable Darwin defaults (`$HOME/Library/Caches`) without adding dependencies.
 
 ## SSH Forwarding
 Use OpenSSH remote forwarding of Unix sockets from Linux VM to macOS host:

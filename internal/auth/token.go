@@ -84,6 +84,9 @@ func TokenDir() (string, error) {
 	if dir := os.Getenv("OP_FORWARD_TOKEN_DIR"); dir != "" {
 		return sanitizePath(dir)
 	}
+	if state := os.Getenv("XDG_STATE_HOME"); state != "" {
+		return sanitizePath(filepath.Join(state, CacheDirName))
+	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("determining cache directory: %w", err)

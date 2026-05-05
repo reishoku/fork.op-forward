@@ -12,6 +12,9 @@ func SocketPath() (string, error) {
 	if p := os.Getenv("OP_FORWARD_SOCKET_PATH"); p != "" {
 		return sanitizeSocketPath(p)
 	}
+	if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
+		return sanitizeSocketPath(filepath.Join(runtimeDir, DefaultSocketName))
+	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		home, _ := os.UserHomeDir()
