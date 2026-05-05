@@ -11,7 +11,8 @@ Current loopback TCP+HTTP transport relies on bearer tokens and SSH remote port 
   - Linux: `SO_PEERCRED`.
   - macOS: `LOCAL_PEERCRED` (`Xucred`).
 - On request handling, deny mismatched UID with `403 Forbidden`.
-- Keep official SDK/stdlib only (`net`, `net/http`, `syscall`) and no extra dependencies.
+- Keep official SDK/stdlib only (`net`, `net/http`, `syscall`, `path/filepath`) and no extra dependencies.
+- Path traversal countermeasure (CWE-22): all operator-configurable paths (`OP_FORWARD_SOCKET_PATH`, `OP_FORWARD_TOKEN_DIR`, `OP_FORWARD_TOKEN_FILE`) are canonicalized with `filepath.Clean` and must be absolute (`filepath.IsAbs`), rejecting relative paths such as `../../tmp/x.sock`.
 
 ## SSH Forwarding
 Use OpenSSH remote forwarding of Unix sockets from Linux VM to macOS host:
@@ -23,6 +24,7 @@ ssh -fN -R /tmp/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock 
 Set `OP_FORWARD_SOCKET_PATH=/tmp/op-forward.sock` on the remote client side.
 
 ## Security review (CWE)
+- CWE-22 Path Traversal: mitigated by path canonicalization and absolute-path enforcement for env-configured filesystem targets.
 - CWE-284 Improper Access Control: mitigated with socket FS permissions + UID match.
 - CWE-306 Missing Authentication for Critical Function: existing bearer token retained.
 - CWE-922 Insecure Storage: existing token file permission constraints retained.
@@ -30,6 +32,7 @@ Set `OP_FORWARD_SOCKET_PATH=/tmp/op-forward.sock` on the remote client side.
 
 ## References
 - Go `net` package Unix domain sockets: https://pkg.go.dev/net
+- Go `path/filepath` (`Clean`, `IsAbs`) for canonical path handling: https://pkg.go.dev/path/filepath
 - Go `net/http` server/client APIs: https://pkg.go.dev/net/http
 - OpenSSH `ssh(1)` forwarding syntax (`-R` with Unix sockets): https://man.openbsd.org/ssh.1
 - Linux `unix(7)` and `SO_PEERCRED`: https://linuxman7.org/linux/man-pages/man7/unix.7.html

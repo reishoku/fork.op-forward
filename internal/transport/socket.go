@@ -10,7 +10,7 @@ const DefaultSocketName = "op-forward.sock"
 
 func SocketPath() (string, error) {
 	if p := os.Getenv("OP_FORWARD_SOCKET_PATH"); p != "" {
-		return p, nil
+		return sanitizeSocketPath(p)
 	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
@@ -20,5 +20,16 @@ func SocketPath() (string, error) {
 	if cacheDir == "" {
 		return "", fmt.Errorf("cannot resolve cache directory")
 	}
-	return filepath.Join(cacheDir, "op-forward", DefaultSocketName), nil
+	return sanitizeSocketPath(filepath.Join(cacheDir, "op-forward", DefaultSocketName))
+}
+
+func sanitizeSocketPath(raw string) (string, error) {
+	if raw == "" {
+		return "", fmt.Errorf("empty socket path")
+	}
+	clean := filepath.Clean(raw)
+	if !filepath.IsAbs(clean) {
+		return "", fmt.Errorf("socket path must be absolute: %q", raw)
+	}
+	return clean, nil
 }

@@ -72,16 +72,27 @@ func (t *Token) Renew() {
 
 // ---------- Path helpers ----------
 
+func sanitizePath(raw string) (string, error) {
+	if raw == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	clean := filepath.Clean(raw)
+	if !filepath.IsAbs(clean) {
+		return "", fmt.Errorf("path must be absolute: %q", raw)
+	}
+	return clean, nil
+}
+
 // TokenDir returns the directory for storing tokens.
 func TokenDir() (string, error) {
 	if dir := os.Getenv("OP_FORWARD_TOKEN_DIR"); dir != "" {
-		return dir, nil
+		return sanitizePath(dir)
 	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("determining cache directory: %w", err)
 	}
-	return filepath.Join(cacheDir, CacheDirName), nil
+	return sanitizePath(filepath.Join(cacheDir, CacheDirName))
 }
 
 func tokenFilePath(name string) (string, error) {
@@ -96,7 +107,7 @@ func tokenFilePath(name string) (string, error) {
 // Respects OP_FORWARD_TOKEN_FILE for backward compatibility.
 func AccessTokenPath() (string, error) {
 	if path := os.Getenv("OP_FORWARD_TOKEN_FILE"); path != "" {
-		return path, nil
+		return sanitizePath(path)
 	}
 	return tokenFilePath(AccessTokenFile)
 }

@@ -108,6 +108,7 @@ Now `op` commands inside the VM are forwarded to the host.
 |---|---|---|
 | `OP_FORWARD_PORT` | `18340` | Legacy compatibility flag (unused by socket transport) |
 | `OP_FORWARD_SOCKET_PATH` | platform cache path + `/op-forward.sock` | Unix socket path for daemon/proxy transport |
+| _(security)_ |  | `OP_FORWARD_SOCKET_PATH`, `OP_FORWARD_TOKEN_DIR`, and `OP_FORWARD_TOKEN_FILE` must be absolute paths; relative paths are rejected. |
 | `OP_FORWARD_TOKEN_DIR` | `~/Library/Caches/op-forward` (macOS) / `~/.cache/op-forward` (Linux) | Token storage directory |
 | `OP_FORWARD_TOKEN_FILE` | `$TOKEN_DIR/session.token` | Full path to token file |
 | `OP_FORWARD_PROBE_TIMEOUT_MS` | `500` | Shim TCP probe timeout |
