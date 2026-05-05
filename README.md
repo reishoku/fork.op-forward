@@ -202,6 +202,20 @@ make test           # Run tests
 make clean          # Remove build artifacts
 ```
 
+## Documentation
+
+Deeper reference material lives in [`docs/`](docs/README.md):
+
+- [`docs/architecture.md`](docs/architecture.md) — components, request flow, design rationale
+- [`docs/transport.md`](docs/transport.md) — Unix socket transport and peer-credential enforcement
+- [`docs/tokens.md`](docs/tokens.md) — access/refresh token model, rotation, sliding expiry
+- [`docs/security.md`](docs/security.md) — threat model, defense layers, what's not protected
+- [`docs/protocol.md`](docs/protocol.md) — HTTP API: endpoints, status codes, headers
+- [`docs/configuration.md`](docs/configuration.md) — environment variables and path precedence
+- [`docs/deployment.md`](docs/deployment.md) — host setup, remote setup, SSH tunnel patterns, troubleshooting
+- [`docs/cli.md`](docs/cli.md) — subcommand reference
+- [`docs/development.md`](docs/development.md) — build, test, release pipeline, branch model
+
 ## License
 
 MIT
