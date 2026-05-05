@@ -17,7 +17,7 @@ The 1Password CLI requires desktop integration for biometric unlock (Touch ID on
 op-forward runs a small HTTP daemon on the host machine (where Touch ID works) and installs a transparent `op` shim on the remote side. Every `op` command in the VM is intercepted by the shim, forwarded through an SSH tunnel to the host daemon, and executed locally — triggering Touch ID for each privileged operation.
 
 ```
-Remote VM: op shim → HTTP → SSH RemoteForward → Host daemon → op CLI → Touch ID
+Remote VM: op shim → HTTP-over-UNIX-socket → SSH RemoteForward → Host daemon → op CLI → Touch ID
 ```
 
 The developer experience is transparent: run `op account list` or `op item get <uuid> --fields username` inside any VM, and it works exactly as if `op` were running locally.
@@ -57,7 +57,7 @@ op-forward serve
 op-forward service install
 ```
 
-The daemon listens on `127.0.0.1:18340` (loopback only) and generates a bearer token at `~/Library/Caches/op-forward/session.token`.
+The daemon listens on `unix://~/Library/Caches/op-forward/op-forward.sock` and generates bearer tokens in `~/Library/Caches/op-forward/`.
 
 ### Set up the remote side (VM / Linux)
 
@@ -90,13 +90,14 @@ After installing, deploy the auth token and start the SSH tunnel:
 
 ```bash
 # Deploy auth token (from host)
-scp ~/Library/Caches/op-forward/session.token vm:~/.cache/op-forward/session.token
+scp -r ~/Library/Caches/op-forward/{access.token,refresh.token,session.token} vm:~/.cache/op-forward/
 ```
 
 Start the SSH tunnel:
 
 ```bash
-ssh -R 18340:127.0.0.1:18340 vm
+ssh -R /tmp/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock vm
+export OP_FORWARD_SOCKET_PATH=/tmp/op-forward.sock
 ```
 
 Now `op` commands inside the VM are forwarded to the host.
@@ -105,7 +106,8 @@ Now `op` commands inside the VM are forwarded to the host.
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `OP_FORWARD_PORT` | `18340` | Daemon listen port |
+| `OP_FORWARD_PORT` | `18340` | Legacy compatibility flag (unused by socket transport) |
+| `OP_FORWARD_SOCKET_PATH` | platform cache path + `/op-forward.sock` | Unix socket path for daemon/proxy transport |
 | `OP_FORWARD_TOKEN_DIR` | `~/Library/Caches/op-forward` (macOS) / `~/.cache/op-forward` (Linux) | Token storage directory |
 | `OP_FORWARD_TOKEN_FILE` | `$TOKEN_DIR/session.token` | Full path to token file |
 | `OP_FORWARD_PROBE_TIMEOUT_MS` | `500` | Shim TCP probe timeout |

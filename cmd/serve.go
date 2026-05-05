@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/ekovshilovsky/op-forward/internal/transport"
+
 	"github.com/ekovshilovsky/op-forward/internal/auth"
 	"github.com/ekovshilovsky/op-forward/internal/daemon"
 )
@@ -54,9 +56,14 @@ func runServe() error {
 		auth.SaveToPath(accessToken, legacyPath)
 	}
 
-	fmt.Printf("Starting daemon on 127.0.0.1:%d\n", *port)
+	socketPath, err := transport.SocketPath()
+	if err != nil {
+		return fmt.Errorf("socket path: %w", err)
+	}
+	fmt.Printf("Starting daemon on unix://%s\n", socketPath)
 
-	server := daemon.New(accessToken, refreshToken, *port, Version)
+	_ = port // legacy flag retained for CLI compatibility
+	server := daemon.New(accessToken, refreshToken, socketPath, Version)
 	return server.Start()
 }
 

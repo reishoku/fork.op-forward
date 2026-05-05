@@ -27,7 +27,7 @@ func newTestServer() (*Server, string, string) {
 	srv := &Server{
 		accessToken:  accessToken,
 		refreshToken: refreshToken,
-		port:         18340,
+		socketPath:   "/tmp/op-forward-test.sock",
 		version:      "0.3.0",
 	}
 	return srv, accessToken.Value, refreshToken.Value
@@ -100,7 +100,7 @@ func TestExecute_ExpiredToken(t *testing.T) {
 		Expires: time.Now().Add(30 * 24 * time.Hour),
 		TTL:     auth.RefreshTokenTTL,
 	}
-	srv := &Server{accessToken: accessToken, refreshToken: refreshToken, port: 18340, version: "0.3.0"}
+	srv := &Server{accessToken: accessToken, refreshToken: refreshToken, socketPath: "/tmp/op-forward-test.sock", version: "0.3.0"}
 
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("POST", "/op/execute", bytes.NewReader(body))
