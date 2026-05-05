@@ -4,7 +4,8 @@ package transport
 
 import (
 	"net"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func PeerUID(conn *net.UnixConn) (int, error) {
@@ -15,7 +16,7 @@ func PeerUID(conn *net.UnixConn) (int, error) {
 	uid := -1
 	var opErr error
 	err = raw.Control(func(fd uintptr) {
-		cred, e := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+		cred, e := unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
 		if e != nil {
 			opErr = e
 			return

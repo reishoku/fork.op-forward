@@ -137,7 +137,7 @@ op-forward is designed for environments where the host is trusted and the remote
 
 Additional layers:
 
-- **Loopback-only binding**: The daemon hard-codes `127.0.0.1` and refuses to bind to any non-loopback address. It is unreachable from the network.
+- **Unix socket transport**: The daemon listens on a filesystem Unix socket instead of a TCP port. The socket directory is created with `0700` permissions, the socket inode is set to `0600`, and peer credentials are checked so only the same user can execute forwarded requests.
 - **Bearer token authentication**: A 32-byte random hex token with 30-day sliding expiry. Generated on first run, stored with 0600 permissions.
 - **No shell execution**: Commands are executed via `os/exec` (direct exec), not through a shell. Shell injection is structurally impossible.
 - **Argument sanitization**: Arguments containing shell metacharacters (`` ` ``, `$`, `|`, `;`, `&`, newlines) are rejected before execution.

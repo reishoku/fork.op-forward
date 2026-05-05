@@ -33,7 +33,7 @@ ssh -fN -R /tmp/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock 
 Set `OP_FORWARD_SOCKET_PATH=/tmp/op-forward.sock` on the remote client side.
 
 ## Security review (CWE)
-- CWE-22 Path Traversal: mitigated by path canonicalization and absolute-path enforcement for env-configured filesystem targets.
+- CWE-22 Path Traversal: token persistence is constrained to the configured token directory with `os.Root`; socket paths are canonicalized and must be absolute.
 - CWE-284 Improper Access Control: mitigated with socket FS permissions + UID match.
 - CWE-306 Missing Authentication for Critical Function: existing bearer token retained.
 - CWE-922 Insecure Storage: existing token file permission constraints retained.

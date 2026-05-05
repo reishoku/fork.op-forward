@@ -263,6 +263,9 @@ func proxyTokenPath(filename string) string {
 	if dir := os.Getenv("OP_FORWARD_TOKEN_DIR"); dir != "" {
 		return filepath.Join(dir, filename)
 	}
+	if state := os.Getenv("XDG_STATE_HOME"); state != "" {
+		return filepath.Join(state, "op-forward", filename)
+	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		home, _ := os.UserHomeDir()
