@@ -3,6 +3,8 @@ package cmd
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/ekovshilovsky/op-forward/internal/auth"
 )
 
 func TestProxyTokenPathUsesXDGStateHome(t *testing.T) {
@@ -11,8 +13,11 @@ func TestProxyTokenPathUsesXDGStateHome(t *testing.T) {
 	t.Setenv("OP_FORWARD_TOKEN_DIR", "")
 	t.Setenv("XDG_STATE_HOME", stateDir)
 
-	got := proxyTokenPath("refresh.token")
-	want := filepath.Join(stateDir, "op-forward", "refresh.token")
+	got := proxyTokenPath(auth.RefreshTokenFile)
+	want, err := auth.RefreshTokenPath()
+	if err != nil {
+		t.Fatalf("RefreshTokenPath() error: %v", err)
+	}
 	if got != want {
 		t.Fatalf("proxyTokenPath() = %q, want %q", got, want)
 	}
@@ -25,12 +30,12 @@ func TestProxyTokenPathAccessTokenFileOverrideOnlyAppliesToAccess(t *testing.T) 
 	t.Setenv("OP_FORWARD_TOKEN_DIR", "")
 	t.Setenv("XDG_STATE_HOME", stateDir)
 
-	if got := proxyTokenPath("access.token"); got != overridePath {
+	if got := proxyTokenPath(auth.AccessTokenFile); got != overridePath {
 		t.Fatalf("access token path = %q, want %q", got, overridePath)
 	}
 
-	got := proxyTokenPath("refresh.token")
-	want := filepath.Join(stateDir, "op-forward", "refresh.token")
+	got := proxyTokenPath(auth.RefreshTokenFile)
+	want := filepath.Join(stateDir, "op-forward", auth.RefreshTokenFile)
 	if got != want {
 		t.Fatalf("refresh token path = %q, want %q", got, want)
 	}

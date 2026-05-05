@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ekovshilovsky/op-forward/internal/auth"
 	"github.com/ekovshilovsky/op-forward/internal/executor"
 	"github.com/ekovshilovsky/op-forward/internal/transport"
 )
@@ -42,9 +43,9 @@ func runProxy() error {
 	args := fs.Args()
 
 	// Resolve token file paths.
-	accessPath := proxyTokenPath("access.token")
-	refreshPath := proxyTokenPath("refresh.token")
-	legacyPath := proxyTokenPath("session.token")
+	accessPath := proxyTokenPath(auth.AccessTokenFile)
+	refreshPath := proxyTokenPath(auth.RefreshTokenFile)
+	legacyPath := proxyTokenPath(auth.LegacyTokenFile)
 
 	// Read access token, with fallback to legacy session.token.
 	// Also check expiry so we can skip straight to refresh when stale.
@@ -253,24 +254,31 @@ func attemptRefresh(client *http.Client, refreshToken string) (*tokenRefreshResp
 // ---------- Token file helpers ----------
 
 // proxyTokenPath returns the path to a token file on the VM (proxy) side.
-// Uses os.UserCacheDir so the path is correct on both macOS
-// (~/Library/Caches) and Linux (~/.cache).
+// Delegate to the auth package so proxy and daemon token path precedence stays
+// identical.
 func proxyTokenPath(filename string) string {
-	if path := os.Getenv("OP_FORWARD_TOKEN_FILE"); path != "" && filename == "access.token" {
-		return path
-	}
-	if dir := os.Getenv("OP_FORWARD_TOKEN_DIR"); dir != "" {
-		return filepath.Join(dir, filename)
-	}
-	if state := os.Getenv("XDG_STATE_HOME"); state != "" {
-		return filepath.Join(state, "op-forward", filename)
-	}
-	cacheDir, err := os.UserCacheDir()
+	path, err := proxyTokenPathE(filename)
 	if err != nil {
-		home, _ := os.UserHomeDir()
-		cacheDir = filepath.Join(home, ".cache")
+		return ""
 	}
-	return filepath.Join(cacheDir, "op-forward", filename)
+	return path
+}
+
+func proxyTokenPathE(filename string) (string, error) {
+	switch filename {
+	case auth.AccessTokenFile:
+		return auth.AccessTokenPath()
+	case auth.RefreshTokenFile:
+		return auth.RefreshTokenPath()
+	case auth.LegacyTokenFile:
+		return auth.LegacyTokenPath()
+	default:
+		dir, err := auth.TokenDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(dir, filename), nil
+	}
 }
 
 // readTokenValue reads the first line (token value) from a token file.
