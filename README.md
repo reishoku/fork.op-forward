@@ -113,7 +113,7 @@ Now `op` commands inside the VM are forwarded to the host.
 | `OP_FORWARD_TOKEN_DIR` | unset | Explicit token storage directory |
 | `XDG_STATE_HOME` | unset | If set and `OP_FORWARD_TOKEN_DIR` is unset, token dir defaults to `$XDG_STATE_HOME/op-forward` |
 | `OP_FORWARD_TOKEN_FILE` | `$TOKEN_DIR/session.token` | Full path to token file |
-| `OP_FORWARD_PROBE_TIMEOUT_MS` | `500` | Shim TCP probe timeout |
+| `OP_FORWARD_PROBE_TIMEOUT_MS` | `500` | Shim Unix socket probe timeout |
 | `OP_FORWARD_FETCH_TIMEOUT_MS` | `60000` | Shim HTTP request timeout |
 
 Fallback behavior: when `XDG_RUNTIME_DIR` / `XDG_STATE_HOME` are unset, op-forward falls back to `os.UserCacheDir()` (Linux: `$XDG_CACHE_HOME` or `~/.cache`; macOS: `~/Library/Caches`).
@@ -157,7 +157,7 @@ op-forward works with any SSH-accessible VM. For VMs managed by [Colima](https:/
 
 ```bash
 # Start tunnel (ControlMaster disabled to avoid SSH multiplexing conflicts)
-ssh -fN -R 18340:127.0.0.1:18340 \
+ssh -fN -R /tmp/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock \
     -o ControlMaster=no \
     -o ControlPath=none \
     -F ~/.colima/_lima/<vm-profile>/ssh.config \
@@ -167,7 +167,7 @@ ssh -fN -R 18340:127.0.0.1:18340 \
 For standard SSH hosts:
 
 ```bash
-ssh -fN -R 18340:127.0.0.1:18340 user@remote-host
+ssh -fN -R /tmp/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock user@remote-host
 ```
 
 The `ControlMaster=no` flag is important when using SSH multiplexing — multiplexed connections only establish `RemoteForward` on the first connection. A dedicated tunnel connection avoids this.

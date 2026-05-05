@@ -67,7 +67,7 @@ func runProxy() error {
 		fmt.Fprintf(os.Stderr, "op-forward: resolve socket path: %v\n", err)
 		os.Exit(proxyExitInfraFailure)
 	}
-	conn, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
+	conn, err := net.DialTimeout("unix", socketPath, time.Duration(getProbeTimeoutMs())*time.Millisecond)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "op-forward: unix socket tunnel not available at %s\n", socketPath)
 		os.Exit(proxyExitInfraFailure)
@@ -357,4 +357,13 @@ func getProxyTimeout() int {
 		}
 	}
 	return 60000
+}
+
+func getProbeTimeoutMs() int {
+	if t := os.Getenv("OP_FORWARD_PROBE_TIMEOUT_MS"); t != "" {
+		if ms, err := strconv.Atoi(t); err == nil {
+			return ms
+		}
+	}
+	return 500
 }
