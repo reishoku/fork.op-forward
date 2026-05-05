@@ -13,7 +13,8 @@ import (
 	"github.com/ekovshilovsky/op-forward/internal/executor"
 )
 
-func newTestServer() (*Server, string, string) {
+func newTestServer(t *testing.T) (*Server, string, string) {
+	t.Helper()
 	accessToken := &auth.Token{
 		Value:   "test-access-token-abc123",
 		Expires: time.Now().Add(1 * time.Hour),
@@ -27,7 +28,7 @@ func newTestServer() (*Server, string, string) {
 	srv := &Server{
 		accessToken:  accessToken,
 		refreshToken: refreshToken,
-		socketPath:   "/tmp/op-forward-test.sock",
+		socketPath:   filepath.Join(t.TempDir(), "op-forward-test.sock"),
 		version:      "0.3.0",
 	}
 	return srv, accessToken.Value, refreshToken.Value
@@ -41,11 +42,11 @@ func newTestServerWithTempToken(t *testing.T) (*Server, string, string) {
 	tmpDir := t.TempDir()
 	t.Setenv("OP_FORWARD_TOKEN_FILE", filepath.Join(tmpDir, "access.token"))
 	t.Setenv("OP_FORWARD_TOKEN_DIR", tmpDir)
-	return newTestServer()
+	return newTestServer(t)
 }
 
 func TestHealthEndpoint(t *testing.T) {
-	srv, _, _ := newTestServer()
+	srv, _, _ := newTestServer(t)
 	req := httptest.NewRequest("GET", "/health", nil)
 	w := httptest.NewRecorder()
 
@@ -63,7 +64,7 @@ func TestHealthEndpoint(t *testing.T) {
 }
 
 func TestExecute_NoAuth(t *testing.T) {
-	srv, _, _ := newTestServer()
+	srv, _, _ := newTestServer(t)
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("POST", "/op/execute", bytes.NewReader(body))
 	w := httptest.NewRecorder()
@@ -76,7 +77,7 @@ func TestExecute_NoAuth(t *testing.T) {
 }
 
 func TestExecute_WrongToken(t *testing.T) {
-	srv, _, _ := newTestServer()
+	srv, _, _ := newTestServer(t)
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("POST", "/op/execute", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer wrong-token")
@@ -100,7 +101,7 @@ func TestExecute_ExpiredToken(t *testing.T) {
 		Expires: time.Now().Add(30 * 24 * time.Hour),
 		TTL:     auth.RefreshTokenTTL,
 	}
-	srv := &Server{accessToken: accessToken, refreshToken: refreshToken, socketPath: "/tmp/op-forward-test.sock", version: "0.3.0"}
+	srv := &Server{accessToken: accessToken, refreshToken: refreshToken, socketPath: filepath.Join(t.TempDir(), "op-forward-test.sock"), version: "0.3.0"}
 
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("POST", "/op/execute", bytes.NewReader(body))
@@ -115,7 +116,7 @@ func TestExecute_ExpiredToken(t *testing.T) {
 }
 
 func TestExecute_RefreshTokenRejectedForExecute(t *testing.T) {
-	srv, _, refreshToken := newTestServer()
+	srv, _, refreshToken := newTestServer(t)
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("POST", "/op/execute", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+refreshToken)
@@ -129,7 +130,7 @@ func TestExecute_RefreshTokenRejectedForExecute(t *testing.T) {
 }
 
 func TestExecute_WrongMethod(t *testing.T) {
-	srv, accessToken, _ := newTestServer()
+	srv, accessToken, _ := newTestServer(t)
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("GET", "/op/execute", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -181,7 +182,7 @@ func TestExecute_BlockedSubcommand(t *testing.T) {
 }
 
 func TestAuthenticate_MissingHeader(t *testing.T) {
-	srv, _, _ := newTestServer()
+	srv, _, _ := newTestServer(t)
 	req := httptest.NewRequest("POST", "/op/execute", nil)
 
 	if srv.authenticate(req) {
@@ -190,7 +191,7 @@ func TestAuthenticate_MissingHeader(t *testing.T) {
 }
 
 func TestAuthenticate_InvalidScheme(t *testing.T) {
-	srv, accessToken, _ := newTestServer()
+	srv, accessToken, _ := newTestServer(t)
 	req := httptest.NewRequest("POST", "/op/execute", nil)
 	req.Header.Set("Authorization", "Basic "+accessToken)
 
@@ -200,7 +201,7 @@ func TestAuthenticate_InvalidScheme(t *testing.T) {
 }
 
 func TestAuthenticate_ValidToken(t *testing.T) {
-	srv, accessToken, _ := newTestServer()
+	srv, accessToken, _ := newTestServer(t)
 	req := httptest.NewRequest("POST", "/op/execute", nil)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
@@ -286,7 +287,7 @@ func TestTokenRefresh_ExpiredRefreshToken(t *testing.T) {
 }
 
 func TestTokenRefresh_InvalidRefreshToken(t *testing.T) {
-	srv, _, _ := newTestServer()
+	srv, _, _ := newTestServer(t)
 	req := httptest.NewRequest("POST", "/token/refresh", nil)
 	req.Header.Set("Authorization", "Bearer totally-wrong-token")
 	w := httptest.NewRecorder()
@@ -299,7 +300,7 @@ func TestTokenRefresh_InvalidRefreshToken(t *testing.T) {
 }
 
 func TestTokenRefresh_WrongMethod(t *testing.T) {
-	srv, _, _ := newTestServer()
+	srv, _, _ := newTestServer(t)
 	req := httptest.NewRequest("GET", "/token/refresh", nil)
 	w := httptest.NewRecorder()
 
@@ -311,7 +312,7 @@ func TestTokenRefresh_WrongMethod(t *testing.T) {
 }
 
 func TestTokenRefresh_NoAuth(t *testing.T) {
-	srv, _, _ := newTestServer()
+	srv, _, _ := newTestServer(t)
 	req := httptest.NewRequest("POST", "/token/refresh", nil)
 	w := httptest.NewRecorder()
 

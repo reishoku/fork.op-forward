@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
 
 	"github.com/ekovshilovsky/op-forward/internal/transport"
 
@@ -12,11 +11,8 @@ import (
 	"github.com/ekovshilovsky/op-forward/internal/daemon"
 )
 
-const DefaultPort = 18340
-
 func runServe() error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	port := fs.Int("port", getPort(), "Port to listen on")
 	fs.Parse(os.Args[2:])
 
 	// Migrate legacy session.token → refresh.token if upgrading from the
@@ -62,16 +58,6 @@ func runServe() error {
 	}
 	fmt.Printf("Starting daemon on unix://%s\n", socketPath)
 
-	_ = port // legacy flag retained for CLI compatibility
 	server := daemon.New(accessToken, refreshToken, socketPath, Version)
 	return server.Start()
-}
-
-func getPort() int {
-	if p := os.Getenv("OP_FORWARD_PORT"); p != "" {
-		if port, err := strconv.Atoi(p); err == nil {
-			return port
-		}
-	}
-	return DefaultPort
 }

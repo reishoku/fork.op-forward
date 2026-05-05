@@ -5,7 +5,7 @@ Current loopback TCP+HTTP transport relies on bearer tokens and SSH remote port 
 
 ## Design
 - Keep `net/http` protocol handlers and token model unchanged for compatibility.
-- Replace daemon listener from `127.0.0.1:18340` to `unix://$OP_FORWARD_SOCKET_PATH` (default: cache dir `op-forward.sock`).
+- Replace the loopback TCP listener with `unix://$OP_FORWARD_SOCKET_PATH` (default: cache dir `op-forward.sock`).
 - Enforce `0600` on socket inode and `0700` on containing directory.
 - Enable peer credential extraction:
   - Linux: `SO_PEERCRED`.
@@ -27,10 +27,12 @@ Current loopback TCP+HTTP transport relies on bearer tokens and SSH remote port 
 Use OpenSSH remote forwarding of Unix sockets from Linux VM to macOS host:
 
 ```bash
-ssh -fN -R /tmp/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock vm
+# Use the same absolute remote-side path for SSH forwarding and the proxy.
+remote_socket="$HOME/.cache/op-forward/op-forward.sock"
+ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" vm
 ```
 
-Set `OP_FORWARD_SOCKET_PATH=/tmp/op-forward.sock` on the remote client side.
+Set `OP_FORWARD_SOCKET_PATH` to the same remote-side socket path on the remote client side.
 
 ## Security review (CWE)
 - CWE-22 Path Traversal: token persistence is constrained to the configured token directory with `os.Root`; socket paths are canonicalized and must be absolute.

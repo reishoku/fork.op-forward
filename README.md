@@ -96,8 +96,10 @@ scp -r ~/Library/Caches/op-forward/{access.token,refresh.token,session.token} vm
 Start the SSH tunnel:
 
 ```bash
-ssh -R /tmp/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock vm
-export OP_FORWARD_SOCKET_PATH=/tmp/op-forward.sock
+# Use the same absolute remote-side path for SSH forwarding and the proxy.
+remote_socket="$HOME/.cache/op-forward/op-forward.sock"
+ssh -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" vm
+export OP_FORWARD_SOCKET_PATH="$remote_socket"
 ```
 
 Now `op` commands inside the VM are forwarded to the host.
@@ -106,7 +108,6 @@ Now `op` commands inside the VM are forwarded to the host.
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `OP_FORWARD_PORT` | `18340` | Legacy compatibility flag (unused by socket transport) |
 | `OP_FORWARD_SOCKET_PATH` | unset | Explicit Unix socket path for daemon/proxy transport |
 | `XDG_RUNTIME_DIR` | unset | If set and `OP_FORWARD_SOCKET_PATH` is unset, socket defaults to `$XDG_RUNTIME_DIR/op-forward.sock` |
 | _(security)_ |  | Token file operations are constrained to the configured token directory using Go `os.Root` traversal-resistant APIs. |
@@ -121,8 +122,8 @@ Fallback behavior: when `XDG_RUNTIME_DIR` / `XDG_STATE_HOME` are unset, op-forwa
 ## Commands
 
 ```
-op-forward serve [--port PORT]    Start the host daemon
-op-forward install [--port PORT]  Install the op shim on the remote side
+op-forward serve                  Start the host daemon
+op-forward install                Install the op shim on the remote side
 op-forward service install        Install as a launchd daemon (macOS)
 op-forward service uninstall      Remove the launchd daemon
 op-forward update                 Update to the latest release
@@ -157,7 +158,8 @@ op-forward works with any SSH-accessible VM. For VMs managed by [Colima](https:/
 
 ```bash
 # Start tunnel (ControlMaster disabled to avoid SSH multiplexing conflicts)
-ssh -fN -R /tmp/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock \
+remote_socket="$HOME/.cache/op-forward/op-forward.sock"
+ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" \
     -o ControlMaster=no \
     -o ControlPath=none \
     -F ~/.colima/_lima/<vm-profile>/ssh.config \
@@ -167,7 +169,8 @@ ssh -fN -R /tmp/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock 
 For standard SSH hosts:
 
 ```bash
-ssh -fN -R /tmp/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock user@remote-host
+remote_socket="$HOME/.cache/op-forward/op-forward.sock"
+ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" user@remote-host
 ```
 
 The `ControlMaster=no` flag is important when using SSH multiplexing — multiplexed connections only establish `RemoteForward` on the first connection. A dedicated tunnel connection avoids this.

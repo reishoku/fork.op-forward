@@ -36,7 +36,6 @@ const proxyExitInfraFailure = 127
 //  4. On failed refresh, print a clear error and exit.
 func runProxy() error {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
-	_ = fs.Int("port", getProxyPort(), "Legacy daemon port (unused)")
 	timeoutMs := fs.Int("timeout", getProxyTimeout(), "Request timeout in milliseconds")
 	fs.Parse(os.Args[2:])
 
@@ -343,15 +342,6 @@ func printRefreshFailedError(err error) {
 }
 
 // ---------- Config helpers ----------
-
-func getProxyPort() int {
-	if p := os.Getenv("OP_FORWARD_PORT"); p != "" {
-		if port, err := strconv.Atoi(p); err == nil {
-			return port
-		}
-	}
-	return DefaultPort
-}
 
 func getProxyTimeout() int {
 	if t := os.Getenv("OP_FORWARD_FETCH_TIMEOUT_MS"); t != "" {
