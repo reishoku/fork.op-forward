@@ -117,27 +117,50 @@ A few subtleties:
 
 ## SSH `RemoteForward` of Unix sockets
 
-OpenSSH 6.7+ supports forwarding Unix sockets (`man ssh.1`, `-R` syntax). The
-daemon listens on a host-side socket; the proxy dials a remote-side socket
-that SSH ties to that host-side socket.
+OpenSSH 6.7+ supports forwarding Unix sockets (`man ssh.1`, `-R` syntax). In
+this architecture the daemon listens on a socket on the **macOS host**, and
+the proxy on the **VM** dials a socket that SSH ties to the daemon's socket.
+
+`ssh -R remote_socket:local_socket destination` listens on `remote_socket`
+on the SSH **server** (the destination of the SSH command) and forwards to
+`local_socket` on the SSH **client** (the machine running `ssh`). For us
+that means:
+
+- The SSH command runs **on the macOS host** (the client).
+- The SSH destination is **the VM** (the server).
+- `remote_socket` is the path SSH creates on the VM. Must be absolute on
+  the VM's filesystem.
+- `local_socket` is the path the daemon listens on. Must be absolute on the
+  macOS host's filesystem.
+
+Both paths are evaluated by the local shell on the host before `ssh`
+launches; `$HOME` is **not** re-expanded on the VM. Use literal absolute
+paths (or shell variables that expand on the host) for both sides.
 
 Recommended pattern:
 
 ```bash
-remote_socket="$HOME/.cache/op-forward/op-forward.sock"
-ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" \
+# Run on the macOS host. <vm> is the SSH destination (alias / hostname / user@host).
+HOST_SOCKET="$HOME/Library/Caches/op-forward/op-forward.sock"
+VM_SOCKET="/home/$USER/.cache/op-forward/op-forward.sock"
+
+ssh -fN -R "$VM_SOCKET:$HOST_SOCKET" \
     -o ControlMaster=no \
     -o ControlPath=none \
-    user@host
-export OP_FORWARD_SOCKET_PATH="$remote_socket"
+    <vm>
+
+# Then on the VM:
+export OP_FORWARD_SOCKET_PATH="/home/$USER/.cache/op-forward/op-forward.sock"
 ```
+
+Adjust `VM_SOCKET` if the VM does not use the Linux-standard `/home/<user>`
+layout — e.g. set it to `/run/user/<uid>/op-forward.sock` to land in
+`$XDG_RUNTIME_DIR` on the VM, or to a `/tmp` path under unusual layouts.
 
 Notes:
 
-- The two paths in `-R remote:host` are absolute on their respective
-  filesystems. Using `$HOME` resolves on each side separately.
-- `OP_FORWARD_SOCKET_PATH` on the remote must equal the *remote-side* path you
-  passed to `-R`.
+- `OP_FORWARD_SOCKET_PATH` on the VM must equal the path you passed to `-R`
+  as `remote_socket` (i.e. the VM-side path).
 - `ControlMaster=no` plus `ControlPath=none` disables SSH connection
   multiplexing. With multiplexing, only the *first* SSH connection sets up
   `RemoteForward`; later connections share the master channel and do **not**
@@ -145,6 +168,10 @@ Notes:
   entirely. See [`deployment.md` § Multiplexing pitfall](deployment.md#multiplexing-pitfall).
 - `-fN` puts the tunnel in the background and runs no remote command, so the
   connection lives until you kill it.
+- `ssh` will fail with `Error: remote port forwarding failed for listen path
+  …` if the VM-side parent directory doesn't exist or isn't writable by the
+  SSH user. Pre-create it with `mkdir -p ~/.cache/op-forward && chmod 700
+  ~/.cache/op-forward` on the VM.
 
 ## HTTP-over-Unix client
 

@@ -126,10 +126,18 @@ canonical path remains.
 
   Updates: `sudo apt-get update && sudo apt-get upgrade op-forward`.
 
-- **Manual download**:
+- **Manual download** — release assets are named
+  `op-forward_<version>_<os>_<arch>.tar.gz`, so the URL needs the version.
+  Either invoke `scripts/install.sh` (which fetches the latest tag and
+  composes the URL) or do it explicitly:
 
   ```bash
-  curl -fsSL "https://github.com/reishoku/fork.op-forward/releases/latest/download/op-forward_$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/').tar.gz" \
+  VERSION=$(curl -fsSL https://api.github.com/repos/reishoku/fork.op-forward/releases/latest \
+            | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+  ARCH=$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/')
+  OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+  mkdir -p ~/.local/bin
+  curl -fsSL "https://github.com/reishoku/fork.op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_${OS}_${ARCH}.tar.gz" \
     | tar -xz -C ~/.local/bin/
   ```
 
@@ -187,23 +195,44 @@ Notes:
 
 ### 4. Bring up the SSH tunnel
 
+The SSH command is run **on the macOS host**; its destination argument is
+the **VM**. `ssh -R remote_socket:local_socket destination` listens on
+`remote_socket` on the SSH server (the VM) and forwards to `local_socket`
+on the SSH client (the host). Both paths are evaluated by the host's local
+shell before `ssh` launches — `$HOME` is **not** re-expanded on the VM, so
+write the VM-side path explicitly.
+
 ```bash
-remote_socket="$HOME/.cache/op-forward/op-forward.sock"
-ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" \
+# Run on the macOS host. <vm> is the SSH destination (alias / hostname / user@vm).
+HOST_SOCKET="$HOME/Library/Caches/op-forward/op-forward.sock"
+VM_SOCKET="/home/$USER/.cache/op-forward/op-forward.sock"
+
+ssh -fN -R "$VM_SOCKET:$HOST_SOCKET" \
     -o ControlMaster=no \
     -o ControlPath=none \
-    user@host
-export OP_FORWARD_SOCKET_PATH="$remote_socket"
+    <vm>
+
+# Then on the VM:
+export OP_FORWARD_SOCKET_PATH="/home/$USER/.cache/op-forward/op-forward.sock"
 ```
+
+Adjust `VM_SOCKET` if the VM does not use the Linux-standard
+`/home/<user>` layout. For example, on systemd hosts a path under
+`$XDG_RUNTIME_DIR` (typically `/run/user/<uid>`) is a good choice.
 
 What each flag does:
 
 | Flag                       | Purpose |
 |----------------------------|---------|
 | `-fN`                      | Background; do not run a remote command. The tunnel persists until the SSH process exits. |
-| `-R remote:host`           | Forward remote-side `remote_socket` to host-side `host_socket`. |
+| `-R VM_SOCKET:HOST_SOCKET` | Listen on `VM_SOCKET` on the VM (SSH server) and forward to `HOST_SOCKET` on the macOS host (SSH client). |
 | `-o ControlMaster=no`      | Disable creating a master multiplex channel. |
 | `-o ControlPath=none`      | Disable joining an existing master channel. |
+
+If `ssh` reports `Error: remote port forwarding failed for listen path …`,
+the parent of `VM_SOCKET` doesn't exist or isn't writable by the SSH user.
+Pre-create it on the VM with `mkdir -p ~/.cache/op-forward && chmod 700
+~/.cache/op-forward`.
 
 ### Multiplexing pitfall
 
@@ -229,8 +258,13 @@ For VMs managed by [Lima](https://github.com/lima-vm/lima) or
 [Colima](https://github.com/abiosoft/colima), use the per-VM ssh config:
 
 ```bash
-remote_socket="$HOME/.cache/op-forward/op-forward.sock"
-ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" \
+# Run on the macOS host. First, discover the VM-side $HOME (one-time).
+VM_HOME=$(ssh -F ~/.colima/_lima/<vm-profile>/ssh.config lima-<vm-profile> 'printenv HOME')
+
+HOST_SOCKET="$HOME/Library/Caches/op-forward/op-forward.sock"
+VM_SOCKET="$VM_HOME/.cache/op-forward/op-forward.sock"
+
+ssh -fN -R "$VM_SOCKET:$HOST_SOCKET" \
     -o ControlMaster=no \
     -o ControlPath=none \
     -F ~/.colima/_lima/<vm-profile>/ssh.config \
@@ -238,7 +272,10 @@ ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" \
 ```
 
 The `-F` argument points at Lima's per-VM SSH config; the `-o` overrides
-shadow any multiplexing it might enable.
+shadow any multiplexing it might enable. Resolving `VM_HOME` once via SSH
+sidesteps username differences between macOS and the Linux VM (Colima
+defaults to a Linux user that mirrors the macOS username, but Lima can be
+configured otherwise).
 
 ### 5. Verify the tunnel
 
