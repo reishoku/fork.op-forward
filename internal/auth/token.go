@@ -76,11 +76,7 @@ func sanitizePath(raw string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("empty path")
 	}
-	clean := filepath.Clean(raw)
-	if !filepath.IsAbs(clean) {
-		return "", fmt.Errorf("path must be absolute: %q", raw)
-	}
-	return clean, nil
+	return filepath.Clean(raw), nil
 }
 
 // TokenDir returns the directory for storing tokens.
@@ -132,16 +128,28 @@ func TokenPath() (string, error) {
 
 // SaveToPath writes a token to the specified path atomically.
 func SaveToPath(t *Token, path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	if !filepath.IsLocal(base) {
+		return fmt.Errorf("invalid token filename: %q", base)
+	}
+
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("creating token directory: %w", err)
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("opening token root: %w", err)
+	}
+	defer root.Close()
+
 	content := fmt.Sprintf("%s\n%s\n", t.Value, t.Expires.Format(time.RFC3339))
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), 0600); err != nil {
+	tmp := base + ".tmp"
+	if err := root.WriteFile(tmp, []byte(content), 0600); err != nil {
 		return fmt.Errorf("writing token: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+	if err := root.Rename(tmp, base); err != nil {
+		_ = root.Remove(tmp)
 		return fmt.Errorf("renaming token file: %w", err)
 	}
 	return nil
@@ -150,7 +158,19 @@ func SaveToPath(t *Token, path string) error {
 // LoadFromPath reads a token from the specified path.
 // The TTL field is not stored on disk, so the caller must set it.
 func LoadFromPath(path string) (*Token, error) {
-	data, err := os.ReadFile(path)
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	if !filepath.IsLocal(base) {
+		return nil, fmt.Errorf("invalid token filename: %q", base)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("opening token root: %w", err)
+	}
+	defer root.Close()
+
+	data, err := root.ReadFile(base)
 	if err != nil {
 		return nil, fmt.Errorf("reading token: %w", err)
 	}

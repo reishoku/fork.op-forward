@@ -12,7 +12,7 @@ Current loopback TCP+HTTP transport relies on bearer tokens and SSH remote port 
   - macOS: `LOCAL_PEERCRED` (`Xucred`).
 - On request handling, deny mismatched UID with `403 Forbidden`.
 - Keep official SDK/stdlib only (`net`, `net/http`, `syscall`, `path/filepath`) and no extra dependencies.
-- Path traversal countermeasure (CWE-22): all operator-configurable paths (`OP_FORWARD_SOCKET_PATH`, `OP_FORWARD_TOKEN_DIR`, `OP_FORWARD_TOKEN_FILE`) are canonicalized with `filepath.Clean` and must be absolute (`filepath.IsAbs`), rejecting relative paths such as `../../tmp/x.sock`.
+- Path traversal countermeasure (CWE-22): token persistence uses Go's traversal-resistant `os.Root` API (`os.OpenRoot` + `Root.ReadFile`/`Root.WriteFile`/`Root.Rename`) so token file operations are constrained to the configured token directory even in the presence of symlinks and `..` components.
 
 ## SSH Forwarding
 Use OpenSSH remote forwarding of Unix sockets from Linux VM to macOS host:
@@ -32,6 +32,7 @@ Set `OP_FORWARD_SOCKET_PATH=/tmp/op-forward.sock` on the remote client side.
 
 ## References
 - Go `net` package Unix domain sockets: https://pkg.go.dev/net
+- Go `os.Root` traversal-resistant file APIs: https://pkg.go.dev/os#Root
 - Go `path/filepath` (`Clean`, `IsAbs`) for canonical path handling: https://pkg.go.dev/path/filepath
 - Go `net/http` server/client APIs: https://pkg.go.dev/net/http
 - OpenSSH `ssh(1)` forwarding syntax (`-R` with Unix sockets): https://man.openbsd.org/ssh.1
