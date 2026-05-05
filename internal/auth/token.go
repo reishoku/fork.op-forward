@@ -72,16 +72,26 @@ func (t *Token) Renew() {
 
 // ---------- Path helpers ----------
 
+func sanitizePath(raw string) (string, error) {
+	if raw == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	return filepath.Clean(raw), nil
+}
+
 // TokenDir returns the directory for storing tokens.
 func TokenDir() (string, error) {
 	if dir := os.Getenv("OP_FORWARD_TOKEN_DIR"); dir != "" {
-		return dir, nil
+		return sanitizePath(dir)
+	}
+	if state := os.Getenv("XDG_STATE_HOME"); state != "" {
+		return sanitizePath(filepath.Join(state, CacheDirName))
 	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("determining cache directory: %w", err)
 	}
-	return filepath.Join(cacheDir, CacheDirName), nil
+	return sanitizePath(filepath.Join(cacheDir, CacheDirName))
 }
 
 func tokenFilePath(name string) (string, error) {
@@ -96,7 +106,7 @@ func tokenFilePath(name string) (string, error) {
 // Respects OP_FORWARD_TOKEN_FILE for backward compatibility.
 func AccessTokenPath() (string, error) {
 	if path := os.Getenv("OP_FORWARD_TOKEN_FILE"); path != "" {
-		return path, nil
+		return sanitizePath(path)
 	}
 	return tokenFilePath(AccessTokenFile)
 }
@@ -121,16 +131,28 @@ func TokenPath() (string, error) {
 
 // SaveToPath writes a token to the specified path atomically.
 func SaveToPath(t *Token, path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	if !filepath.IsLocal(base) {
+		return fmt.Errorf("invalid token filename: %q", base)
+	}
+
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("creating token directory: %w", err)
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("opening token root: %w", err)
+	}
+	defer root.Close()
+
 	content := fmt.Sprintf("%s\n%s\n", t.Value, t.Expires.Format(time.RFC3339))
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), 0600); err != nil {
+	tmp := base + ".tmp"
+	if err := root.WriteFile(tmp, []byte(content), 0600); err != nil {
 		return fmt.Errorf("writing token: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+	if err := root.Rename(tmp, base); err != nil {
+		_ = root.Remove(tmp)
 		return fmt.Errorf("renaming token file: %w", err)
 	}
 	return nil
@@ -139,7 +161,19 @@ func SaveToPath(t *Token, path string) error {
 // LoadFromPath reads a token from the specified path.
 // The TTL field is not stored on disk, so the caller must set it.
 func LoadFromPath(path string) (*Token, error) {
-	data, err := os.ReadFile(path)
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	if !filepath.IsLocal(base) {
+		return nil, fmt.Errorf("invalid token filename: %q", base)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("opening token root: %w", err)
+	}
+	defer root.Close()
+
+	data, err := root.ReadFile(base)
 	if err != nil {
 		return nil, fmt.Errorf("reading token: %w", err)
 	}

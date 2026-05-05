@@ -1,18 +1,22 @@
 package daemon
 
 import (
+	"context"
 	"crypto/hmac"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/ekovshilovsky/op-forward/internal/auth"
 	"github.com/ekovshilovsky/op-forward/internal/executor"
+	"github.com/ekovshilovsky/op-forward/internal/transport"
 	"github.com/ekovshilovsky/op-forward/internal/version"
 )
 
@@ -26,29 +30,29 @@ type Server struct {
 	accessToken  *auth.Token
 	refreshToken *auth.Token
 	mu           sync.Mutex // Protects token state during concurrent renewal
-	port         int
+	socketPath   string
 	version      string // Server's own version, used for client compatibility checks
 }
 
 // New creates a new daemon server with separate access and refresh tokens.
-func New(accessToken, refreshToken *auth.Token, port int, version string) *Server {
+func New(accessToken, refreshToken *auth.Token, socketPath, version string) *Server {
 	return &Server{
 		accessToken:  accessToken,
 		refreshToken: refreshToken,
-		port:         port,
+		socketPath:   socketPath,
 		version:      version,
 	}
 }
 
 // Start begins listening on the loopback interface.
 func (s *Server) Start() error {
-	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
-
-	// Verify we're binding to loopback only — refuse any other address.
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil || (host != "127.0.0.1" && host != "::1" && host != "localhost") {
-		return fmt.Errorf("refusing to bind to non-loopback address: %s", addr)
+	if s.socketPath == "" {
+		return fmt.Errorf("empty socket path")
 	}
+	if err := os.MkdirAll(filepath.Dir(s.socketPath), 0o700); err != nil {
+		return fmt.Errorf("creating socket dir: %w", err)
+	}
+	_ = os.Remove(s.socketPath)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
@@ -56,15 +60,40 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/token/refresh", s.handleTokenRefresh)
 
 	server := &http.Server{
-		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: executor.MaxTimeout + 10*time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
-	fmt.Printf("op-forward daemon listening on %s\n", addr)
-	return server.ListenAndServe()
+	ln, err := net.Listen("unix", s.socketPath)
+	if err != nil {
+		return fmt.Errorf("listen on unix socket: %w", err)
+	}
+	if err := os.Chmod(s.socketPath, 0o600); err != nil {
+		return fmt.Errorf("chmod socket: %w", err)
+	}
+	server.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+		if uc, ok := c.(*net.UnixConn); ok {
+			if uid, err := transport.PeerUID(uc); err == nil && uid >= 0 {
+				ctx = context.WithValue(ctx, peerUIDKey{}, uid)
+			}
+		}
+		return ctx
+	}
+	fmt.Printf("op-forward daemon listening on unix://%s\n", s.socketPath)
+	return server.Serve(ln)
+}
+
+type peerUIDKey struct{}
+
+func peerUIDFromRequest(r *http.Request) int {
+	if v := r.Context().Value(peerUIDKey{}); v != nil {
+		if uid, ok := v.(int); ok {
+			return uid
+		}
+	}
+	return -1
 }
 
 // handleHealth returns a simple health check (no auth required).
@@ -77,6 +106,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleExecute runs an op command and returns the result.
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
+	if uid := peerUIDFromRequest(r); uid >= 0 {
+		if uid != os.Getuid() {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
 	// Verify HTTP method
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
