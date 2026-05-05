@@ -79,8 +79,15 @@ To upgrade: `sudo apt-get update && sudo apt-get upgrade op-forward`
 Via manual download:
 
 ```bash
-# Download the latest release for your architecture
-curl -fsSL https://github.com/reishoku/fork.op-forward/releases/latest/download/op-forward_$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/').tar.gz | tar -xz -C ~/.local/bin/
+# Release assets are named op-forward_<version>_<os>_<arch>.tar.gz, so we
+# fetch the latest tag from the GitHub API and compose the URL.
+VERSION=$(curl -fsSL https://api.github.com/repos/reishoku/fork.op-forward/releases/latest \
+          | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+ARCH=$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/')
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/reishoku/fork.op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_${OS}_${ARCH}.tar.gz" \
+  | tar -xz -C ~/.local/bin/
 
 # Install the op shim
 op-forward install
@@ -93,16 +100,27 @@ After installing, deploy the auth token and start the SSH tunnel:
 scp -r ~/Library/Caches/op-forward/{access.token,refresh.token,session.token} vm:~/.cache/op-forward/
 ```
 
-Start the SSH tunnel:
+Start the SSH tunnel. `ssh -R remote_socket:local_socket destination`
+listens on `remote_socket` on the SSH **server** (the VM) and forwards to
+`local_socket` on the SSH **client** (the macOS host); both paths are
+expanded once by the host's shell, so write the VM-side path explicitly.
 
 ```bash
-# Use the same absolute remote-side path for SSH forwarding and the proxy.
-remote_socket="$HOME/.cache/op-forward/op-forward.sock"
-ssh -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" vm
-export OP_FORWARD_SOCKET_PATH="$remote_socket"
+# Run on the macOS host. <vm> is the SSH destination (alias / hostname / user@vm).
+HOST_SOCKET="$HOME/Library/Caches/op-forward/op-forward.sock"
+VM_SOCKET="/home/$USER/.cache/op-forward/op-forward.sock"
+ssh -R "$VM_SOCKET:$HOST_SOCKET" <vm>
 ```
 
-Now `op` commands inside the VM are forwarded to the host.
+Then on the VM:
+
+```bash
+export OP_FORWARD_SOCKET_PATH="/home/$USER/.cache/op-forward/op-forward.sock"
+```
+
+Now `op` commands inside the VM are forwarded to the host. See
+[`docs/deployment.md`](docs/deployment.md) for SSH multiplexing pitfalls,
+non-standard VM home layouts, and Lima/Colima examples.
 
 ## Configuration
 
@@ -154,12 +172,17 @@ The threat model assumes: SSH tunnels are secure, the host machine is not compro
 
 ## Use with VMs (Colima, Lima, etc.)
 
-op-forward works with any SSH-accessible VM. For VMs managed by [Colima](https://github.com/abiosoft/colima) or [Lima](https://github.com/lima-vm/lima), use the VM's SSH config directly:
+op-forward works with any SSH-accessible VM. For VMs managed by [Colima](https://github.com/abiosoft/colima) or [Lima](https://github.com/lima-vm/lima), use the VM's SSH config directly. Resolving `VM_HOME` once via SSH sidesteps username differences between macOS and the VM:
 
 ```bash
+# Run on the macOS host. Discover the VM-side $HOME (one-time).
+VM_HOME=$(ssh -F ~/.colima/_lima/<vm-profile>/ssh.config lima-<vm-profile> 'printenv HOME')
+
+HOST_SOCKET="$HOME/Library/Caches/op-forward/op-forward.sock"
+VM_SOCKET="$VM_HOME/.cache/op-forward/op-forward.sock"
+
 # Start tunnel (ControlMaster disabled to avoid SSH multiplexing conflicts)
-remote_socket="$HOME/.cache/op-forward/op-forward.sock"
-ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" \
+ssh -fN -R "$VM_SOCKET:$HOST_SOCKET" \
     -o ControlMaster=no \
     -o ControlPath=none \
     -F ~/.colima/_lima/<vm-profile>/ssh.config \
@@ -169,8 +192,9 @@ ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" \
 For standard SSH hosts:
 
 ```bash
-remote_socket="$HOME/.cache/op-forward/op-forward.sock"
-ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" user@remote-host
+HOST_SOCKET="$HOME/Library/Caches/op-forward/op-forward.sock"
+VM_SOCKET="/home/$USER/.cache/op-forward/op-forward.sock"
+ssh -fN -R "$VM_SOCKET:$HOST_SOCKET" user@remote-host
 ```
 
 The `ControlMaster=no` flag is important when using SSH multiplexing — multiplexed connections only establish `RemoteForward` on the first connection. A dedicated tunnel connection avoids this.
