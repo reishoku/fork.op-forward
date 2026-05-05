@@ -17,7 +17,7 @@ The 1Password CLI requires desktop integration for biometric unlock (Touch ID on
 op-forward runs a small HTTP daemon on the host machine (where Touch ID works) and installs a transparent `op` shim on the remote side. Every `op` command in the VM is intercepted by the shim, forwarded through an SSH tunnel to the host daemon, and executed locally — triggering Touch ID for each privileged operation.
 
 ```
-Remote VM: op shim → HTTP → SSH RemoteForward → Host daemon → op CLI → Touch ID
+Remote VM: op shim → HTTP-over-UNIX-socket → SSH RemoteForward → Host daemon → op CLI → Touch ID
 ```
 
 The developer experience is transparent: run `op account list` or `op item get <uuid> --fields username` inside any VM, and it works exactly as if `op` were running locally.
@@ -57,7 +57,7 @@ op-forward serve
 op-forward service install
 ```
 
-The daemon listens on `127.0.0.1:18340` (loopback only) and generates a bearer token at `~/Library/Caches/op-forward/session.token`.
+The daemon listens on `unix://~/Library/Caches/op-forward/op-forward.sock` and generates bearer tokens in `~/Library/Caches/op-forward/`.
 
 ### Set up the remote side (VM / Linux)
 
@@ -90,13 +90,16 @@ After installing, deploy the auth token and start the SSH tunnel:
 
 ```bash
 # Deploy auth token (from host)
-scp ~/Library/Caches/op-forward/session.token vm:~/.cache/op-forward/session.token
+scp -r ~/Library/Caches/op-forward/{access.token,refresh.token,session.token} vm:~/.cache/op-forward/
 ```
 
 Start the SSH tunnel:
 
 ```bash
-ssh -R 18340:127.0.0.1:18340 vm
+# Use the same absolute remote-side path for SSH forwarding and the proxy.
+remote_socket="$HOME/.cache/op-forward/op-forward.sock"
+ssh -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" vm
+export OP_FORWARD_SOCKET_PATH="$remote_socket"
 ```
 
 Now `op` commands inside the VM are forwarded to the host.
@@ -105,17 +108,22 @@ Now `op` commands inside the VM are forwarded to the host.
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `OP_FORWARD_PORT` | `18340` | Daemon listen port |
-| `OP_FORWARD_TOKEN_DIR` | `~/Library/Caches/op-forward` (macOS) / `~/.cache/op-forward` (Linux) | Token storage directory |
+| `OP_FORWARD_SOCKET_PATH` | unset | Explicit Unix socket path for daemon/proxy transport |
+| `XDG_RUNTIME_DIR` | unset | If set and `OP_FORWARD_SOCKET_PATH` is unset, socket defaults to `$XDG_RUNTIME_DIR/op-forward.sock` |
+| _(security)_ |  | Token file operations are constrained to the configured token directory using Go `os.Root` traversal-resistant APIs. |
+| `OP_FORWARD_TOKEN_DIR` | unset | Explicit token storage directory |
+| `XDG_STATE_HOME` | unset | If set and `OP_FORWARD_TOKEN_DIR` is unset, token dir defaults to `$XDG_STATE_HOME/op-forward` |
 | `OP_FORWARD_TOKEN_FILE` | `$TOKEN_DIR/session.token` | Full path to token file |
-| `OP_FORWARD_PROBE_TIMEOUT_MS` | `500` | Shim TCP probe timeout |
+| `OP_FORWARD_PROBE_TIMEOUT_MS` | `500` | Shim Unix socket probe timeout |
 | `OP_FORWARD_FETCH_TIMEOUT_MS` | `60000` | Shim HTTP request timeout |
+
+Fallback behavior: when `XDG_RUNTIME_DIR` / `XDG_STATE_HOME` are unset, op-forward falls back to `os.UserCacheDir()` (Linux: `$XDG_CACHE_HOME` or `~/.cache`; macOS: `~/Library/Caches`).
 
 ## Commands
 
 ```
-op-forward serve [--port PORT]    Start the host daemon
-op-forward install [--port PORT]  Install the op shim on the remote side
+op-forward serve                  Start the host daemon
+op-forward install                Install the op shim on the remote side
 op-forward service install        Install as a launchd daemon (macOS)
 op-forward service uninstall      Remove the launchd daemon
 op-forward update                 Update to the latest release
@@ -130,7 +138,7 @@ op-forward is designed for environments where the host is trusted and the remote
 
 Additional layers:
 
-- **Loopback-only binding**: The daemon hard-codes `127.0.0.1` and refuses to bind to any non-loopback address. It is unreachable from the network.
+- **Unix socket transport**: The daemon listens on a filesystem Unix socket instead of a TCP port. The socket directory is created with `0700` permissions, the socket inode is set to `0600`, and peer credentials are checked so only the same user can execute forwarded requests.
 - **Bearer token authentication**: A 32-byte random hex token with 30-day sliding expiry. Generated on first run, stored with 0600 permissions.
 - **No shell execution**: Commands are executed via `os/exec` (direct exec), not through a shell. Shell injection is structurally impossible.
 - **Argument sanitization**: Arguments containing shell metacharacters (`` ` ``, `$`, `|`, `;`, `&`, newlines) are rejected before execution.
@@ -150,7 +158,8 @@ op-forward works with any SSH-accessible VM. For VMs managed by [Colima](https:/
 
 ```bash
 # Start tunnel (ControlMaster disabled to avoid SSH multiplexing conflicts)
-ssh -fN -R 18340:127.0.0.1:18340 \
+remote_socket="$HOME/.cache/op-forward/op-forward.sock"
+ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" \
     -o ControlMaster=no \
     -o ControlPath=none \
     -F ~/.colima/_lima/<vm-profile>/ssh.config \
@@ -160,7 +169,8 @@ ssh -fN -R 18340:127.0.0.1:18340 \
 For standard SSH hosts:
 
 ```bash
-ssh -fN -R 18340:127.0.0.1:18340 user@remote-host
+remote_socket="$HOME/.cache/op-forward/op-forward.sock"
+ssh -fN -R "$remote_socket:$HOME/Library/Caches/op-forward/op-forward.sock" user@remote-host
 ```
 
 The `ControlMaster=no` flag is important when using SSH multiplexing — multiplexed connections only establish `RemoteForward` on the first connection. A dedicated tunnel connection avoids this.

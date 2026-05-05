@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,7 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ekovshilovsky/op-forward/internal/auth"
 	"github.com/ekovshilovsky/op-forward/internal/executor"
+	"github.com/ekovshilovsky/op-forward/internal/transport"
 )
 
 // proxyExitInfraFailure is the exit code the proxy uses to signal that
@@ -34,16 +37,15 @@ const proxyExitInfraFailure = 127
 //  4. On failed refresh, print a clear error and exit.
 func runProxy() error {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
-	port := fs.Int("port", getProxyPort(), "Daemon port")
 	timeoutMs := fs.Int("timeout", getProxyTimeout(), "Request timeout in milliseconds")
 	fs.Parse(os.Args[2:])
 
 	args := fs.Args()
 
 	// Resolve token file paths.
-	accessPath := proxyTokenPath("access.token")
-	refreshPath := proxyTokenPath("refresh.token")
-	legacyPath := proxyTokenPath("session.token")
+	accessPath := proxyTokenPath(auth.AccessTokenFile)
+	refreshPath := proxyTokenPath(auth.RefreshTokenFile)
+	legacyPath := proxyTokenPath(auth.LegacyTokenFile)
 
 	// Read access token, with fallback to legacy session.token.
 	// Also check expiry so we can skip straight to refresh when stale.
@@ -60,11 +62,14 @@ func runProxy() error {
 		// Fall through — accessValid is false, will trigger refresh below.
 	}
 
-	// Probe tunnel availability (fast TCP check).
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
-	conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	socketPath, err := transport.SocketPath()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "op-forward: tunnel not available on port %d\n", *port)
+		fmt.Fprintf(os.Stderr, "op-forward: resolve socket path: %v\n", err)
+		os.Exit(proxyExitInfraFailure)
+	}
+	conn, err := net.DialTimeout("unix", socketPath, time.Duration(getProbeTimeoutMs())*time.Millisecond)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "op-forward: unix socket tunnel not available at %s\n", socketPath)
 		os.Exit(proxyExitInfraFailure)
 	}
 	conn.Close()
@@ -81,7 +86,14 @@ func runProxy() error {
 	}
 
 	httpTimeout := time.Duration(*timeoutMs)*time.Millisecond + 5*time.Second
-	client := &http.Client{Timeout: httpTimeout}
+	transportRT := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_ = network
+			_ = addr
+			return (&net.Dialer{Timeout: 1 * time.Second}).DialContext(ctx, "unix", socketPath)
+		},
+	}
+	client := &http.Client{Timeout: httpTimeout, Transport: transportRT}
 
 	// If the access token is known-expired, skip directly to refresh
 	// instead of burning a round-trip to get a 401.
@@ -89,7 +101,7 @@ func runProxy() error {
 	var respBody []byte
 
 	if accessValid && accessToken != "" {
-		resp, respBody, err = executeWithAuth(client, addr, bodyBytes, accessToken)
+		resp, respBody, err = executeWithAuth(client, bodyBytes, accessToken)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "op-forward: %v\n", err)
 			os.Exit(proxyExitInfraFailure)
@@ -112,7 +124,7 @@ func runProxy() error {
 			os.Exit(proxyExitInfraFailure)
 		}
 
-		newTokens, refreshErr := attemptRefresh(client, addr, refreshToken)
+		newTokens, refreshErr := attemptRefresh(client, refreshToken)
 		if refreshErr != nil {
 			// Refresh failed — print actionable error and exit.
 			printRefreshFailedError(refreshErr)
@@ -124,7 +136,7 @@ func runProxy() error {
 		saveTokenFile(refreshPath, newTokens.RefreshToken, newTokens.RefreshExpires)
 
 		// Retry the original request with the new access token.
-		resp, respBody, err = executeWithAuth(client, addr, bodyBytes, newTokens.AccessToken)
+		resp, respBody, err = executeWithAuth(client, bodyBytes, newTokens.AccessToken)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "op-forward: %v\n", err)
 			os.Exit(proxyExitInfraFailure)
@@ -169,8 +181,8 @@ func runProxy() error {
 }
 
 // executeWithAuth sends a POST to /op/execute with the given bearer token.
-func executeWithAuth(client *http.Client, addr string, body []byte, token string) (*http.Response, []byte, error) {
-	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/op/execute", addr), bytes.NewReader(body))
+func executeWithAuth(client *http.Client, body []byte, token string) (*http.Response, []byte, error) {
+	req, err := http.NewRequest("POST", "http://unix/op/execute", bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating request: %w", err)
 	}
@@ -204,8 +216,8 @@ type tokenRefreshResponse struct {
 
 // attemptRefresh calls the daemon's /token/refresh endpoint with the given
 // refresh token and returns the new token pair on success.
-func attemptRefresh(client *http.Client, addr, refreshToken string) (*tokenRefreshResponse, error) {
-	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/token/refresh", addr), nil)
+func attemptRefresh(client *http.Client, refreshToken string) (*tokenRefreshResponse, error) {
+	req, err := http.NewRequest("POST", "http://unix/token/refresh", nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating refresh request: %w", err)
 	}
@@ -242,21 +254,31 @@ func attemptRefresh(client *http.Client, addr, refreshToken string) (*tokenRefre
 // ---------- Token file helpers ----------
 
 // proxyTokenPath returns the path to a token file on the VM (proxy) side.
-// Uses os.UserCacheDir so the path is correct on both macOS
-// (~/Library/Caches) and Linux (~/.cache).
+// Delegate to the auth package so proxy and daemon token path precedence stays
+// identical.
 func proxyTokenPath(filename string) string {
-	if path := os.Getenv("OP_FORWARD_TOKEN_FILE"); path != "" && filename == "access.token" {
-		return path
-	}
-	if dir := os.Getenv("OP_FORWARD_TOKEN_DIR"); dir != "" {
-		return filepath.Join(dir, filename)
-	}
-	cacheDir, err := os.UserCacheDir()
+	path, err := proxyTokenPathE(filename)
 	if err != nil {
-		home, _ := os.UserHomeDir()
-		cacheDir = filepath.Join(home, ".cache")
+		return ""
 	}
-	return filepath.Join(cacheDir, "op-forward", filename)
+	return path
+}
+
+func proxyTokenPathE(filename string) (string, error) {
+	switch filename {
+	case auth.AccessTokenFile:
+		return auth.AccessTokenPath()
+	case auth.RefreshTokenFile:
+		return auth.RefreshTokenPath()
+	case auth.LegacyTokenFile:
+		return auth.LegacyTokenPath()
+	default:
+		dir, err := auth.TokenDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(dir, filename), nil
+	}
 }
 
 // readTokenValue reads the first line (token value) from a token file.
@@ -329,15 +351,6 @@ func printRefreshFailedError(err error) {
 
 // ---------- Config helpers ----------
 
-func getProxyPort() int {
-	if p := os.Getenv("OP_FORWARD_PORT"); p != "" {
-		if port, err := strconv.Atoi(p); err == nil {
-			return port
-		}
-	}
-	return DefaultPort
-}
-
 func getProxyTimeout() int {
 	if t := os.Getenv("OP_FORWARD_FETCH_TIMEOUT_MS"); t != "" {
 		if ms, err := strconv.Atoi(t); err == nil {
@@ -345,4 +358,13 @@ func getProxyTimeout() int {
 		}
 	}
 	return 60000
+}
+
+func getProbeTimeoutMs() int {
+	if t := os.Getenv("OP_FORWARD_PROBE_TIMEOUT_MS"); t != "" {
+		if ms, err := strconv.Atoi(t); err == nil {
+			return ms
+		}
+	}
+	return 500
 }

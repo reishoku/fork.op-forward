@@ -44,8 +44,8 @@ func printUsage() {
 	fmt.Printf(`op-forward %s — Forward 1Password CLI across SSH boundaries
 
 Usage:
-  op-forward serve [--port PORT]    Start the host daemon
-  op-forward install [--port PORT]  Install the op shim on the remote side
+  op-forward serve                  Start the host daemon
+  op-forward install                Install the op shim on the remote side
   op-forward proxy [args...]        Forward an op command to the host daemon
   op-forward service install        Install as a launchd daemon (macOS)
   op-forward service uninstall      Remove the launchd daemon
@@ -57,7 +57,7 @@ authentication (Touch ID) through the 1Password desktop app. Commands
 are forwarded from remote environments via SSH tunnel.
 
 Architecture:
-  Remote VM: op shim → HTTP → SSH RemoteForward → Host daemon → op CLI → Touch ID
+  Remote VM: op shim → HTTP-over-UNIX-socket → SSH RemoteForward → Host daemon → op CLI → Touch ID
 
 `, Version)
 }

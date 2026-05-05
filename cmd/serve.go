@@ -4,17 +4,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
+
+	"github.com/ekovshilovsky/op-forward/internal/transport"
 
 	"github.com/ekovshilovsky/op-forward/internal/auth"
 	"github.com/ekovshilovsky/op-forward/internal/daemon"
 )
 
-const DefaultPort = 18340
-
 func runServe() error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	port := fs.Int("port", getPort(), "Port to listen on")
 	fs.Parse(os.Args[2:])
 
 	// Migrate legacy session.token → refresh.token if upgrading from the
@@ -54,17 +52,12 @@ func runServe() error {
 		auth.SaveToPath(accessToken, legacyPath)
 	}
 
-	fmt.Printf("Starting daemon on 127.0.0.1:%d\n", *port)
-
-	server := daemon.New(accessToken, refreshToken, *port, Version)
-	return server.Start()
-}
-
-func getPort() int {
-	if p := os.Getenv("OP_FORWARD_PORT"); p != "" {
-		if port, err := strconv.Atoi(p); err == nil {
-			return port
-		}
+	socketPath, err := transport.SocketPath()
+	if err != nil {
+		return fmt.Errorf("socket path: %w", err)
 	}
-	return DefaultPort
+	fmt.Printf("Starting daemon on unix://%s\n", socketPath)
+
+	server := daemon.New(accessToken, refreshToken, socketPath, Version)
+	return server.Start()
 }

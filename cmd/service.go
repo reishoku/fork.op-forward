@@ -7,7 +7,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
-	"strconv"
 )
 
 const launchdLabel = "com.op-forward.daemon"
@@ -22,8 +21,6 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     <array>
         <string>%s</string>
         <string>serve</string>
-        <string>--port</string>
-        <string>%d</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -80,13 +77,6 @@ func serviceInstall() error {
 		return fmt.Errorf("resolving binary path: %w", err)
 	}
 
-	port := DefaultPort
-	if p := os.Getenv("OP_FORWARD_PORT"); p != "" {
-		if parsed, err := strconv.Atoi(p); err == nil {
-			port = parsed
-		}
-	}
-
 	logPath := filepath.Join(home, "Library", "Logs", "op-forward.log")
 	plistDir := filepath.Join(home, "Library", "LaunchAgents")
 	plistPath := filepath.Join(plistDir, launchdLabel+".plist")
@@ -95,7 +85,7 @@ func serviceInstall() error {
 		return fmt.Errorf("creating LaunchAgents directory: %w", err)
 	}
 
-	plist := fmt.Sprintf(plistTemplate, launchdLabel, binPath, port, home, logPath, logPath)
+	plist := fmt.Sprintf(plistTemplate, launchdLabel, binPath, home, logPath, logPath)
 	if err := os.WriteFile(plistPath, []byte(plist), 0644); err != nil {
 		return fmt.Errorf("writing plist: %w", err)
 	}
