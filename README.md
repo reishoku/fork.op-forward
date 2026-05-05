@@ -35,7 +35,7 @@ brew install reishoku/tap/op-forward
 Via the install script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/reishoku/fork.op-forward/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/reishoku/fork.op-forward/reishoku/scripts/install.sh | sh
 ```
 
 Or build from source:
