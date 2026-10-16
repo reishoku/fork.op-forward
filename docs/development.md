@@ -302,6 +302,7 @@ remains different from upstream `main`:
 | Default endpoint | Unix socket at `endpoint.DefaultSocketPath` (`OP_FORWARD_SOCKET_PATH`, `$XDG_RUNTIME_DIR`, or the cache directory) on both sides; TCP only when `--port`/`--host`, `OP_FORWARD_PORT`/`OP_FORWARD_HOST`, or a `tcp://` endpoint is given. Upstream defaults to `tcp://127.0.0.1:18340` | [internal/endpoint/config.go](../internal/endpoint/config.go), [cmd/config.go](../cmd/config.go) |
 | Token directory | `$XDG_STATE_HOME/op-forward` is preferred over the cache directory when `XDG_STATE_HOME` is set | [internal/auth/token.go](../internal/auth/token.go) |
 | Token file I/O | Reads and writes go through `os.Root` confined to the token file's directory | [internal/auth/token.go](../internal/auth/token.go) |
+| Workflow actions | Every `uses:` is pinned to a full commit SHA with the release tag in a comment, because the fork's Actions policy rejects tag references; upstream uses major tags (`@v6`) | [.github/workflows/](../.github/workflows) |
 | Repository references | `ekovshilovsky/op-forward` → `reishoku/fork.op-forward` (Go module path, badges, releases, install script, Homebrew tap, package repositories on Pages, AUR source URLs); maintainer and security-contact references are unchanged | throughout |
 
 ## See also
