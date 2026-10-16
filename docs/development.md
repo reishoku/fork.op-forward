@@ -200,8 +200,9 @@ pushed tag matching `v*` and on manual dispatch (the dry run). Jobs:
       `-trimpath`, and the version stamp; archive each as `op-forward_<version>_<os>_<arch>.tar.gz`.
    3. Fail unless every Linux binary is reported by `file` as statically linked.
    4. Create the GitHub release with the tarballs and generated notes.
-   5. Update the Homebrew formula in the project's tap repository with the new
-      version and the four checksums.
+   5. Generate the Homebrew formula with the new version and the four checksums,
+      and push it to the project's tap repository when the `HOMEBREW_TAP_TOKEN`
+      secret is configured; otherwise skip the push with a notice.
    6. Import signing keys: one PGP key for APT metadata, RPM packages, and RPM
       metadata, and an RSA key for Alpine (without it, Alpine packages are
       unsigned and the Alpine repository is not published).

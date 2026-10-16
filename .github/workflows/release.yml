@@ -96,6 +96,9 @@ jobs:
             --generate-notes
 
       - name: Update Homebrew formula
+        # The tap push only happens when HOMEBREW_TAP_TOKEN is configured;
+        # otherwise the formula is still generated and the step is skipped
+        # with a notice, so a repository without a tap can still release.
         if: env.DRY_RUN != 'true'
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -143,6 +146,10 @@ jobs:
           end
           FORMULA_EOF
 
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set; formula generated but not published"
+            exit 0
+          fi
           git clone "https://x-access-token:${GH_TOKEN}@github.com/ekovshilovsky/homebrew-tap.git" /tmp/homebrew-tap
           cp /tmp/op-forward.rb /tmp/homebrew-tap/Formula/op-forward.rb
           cd /tmp/homebrew-tap
