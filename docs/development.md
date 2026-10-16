@@ -259,12 +259,22 @@ off, or an index that omits published versions.
 
 ## Versioning and tagging
 
-Releases are tags of the form `vMAJOR.MINOR.PATCH` (tags `v0.7.0` through `v0.7.3`
-exist at this writing). Pushing the tag starts the release workflow, and the tag
-without its `v` is stamped into the binaries and used in package versions. The
-daemon's version comparison understands only three numeric components and treats
-anything else, such as a pre-release suffix, as `0.0.0`, so use plain numeric tags
-(see [protocol.md](protocol.md#version-negotiation)). Raising the minimum
+Releases are tags of the form `vMAJOR.MINOR.PATCH` (upstream tags `v0.7.0` through
+`v0.7.3` exist at this writing). Pushing the tag starts the release workflow, and
+the tag without its `v` is stamped into the binaries and used in package versions.
+Use plain numeric tags. The daemon's comparison ignores a SemVer suffix (see
+[protocol.md](protocol.md#version-negotiation)), but the packaging does not
+tolerate one: nfpm turns `0.7.3-x.1` into `0.7.3~x.1`, which dpkg and rpm sort
+below `0.7.3`; makepkg rejects a hyphen in `pkgver`; apk rejects both `-` and
+`+` suffixes; the Arch package drops the suffix; and
+[scripts/test-packages.sh](../scripts/test-packages.sh) builds file names from
+the raw version.
+
+This fork numbers its own releases in a separate minor series starting at
+`v0.8.0`, so a fork release never shares a tag with a different upstream
+release. The release notes name the upstream version each fork release is based
+on. If upstream reaches `0.8`, the series is reconsidered before the next fork
+release. Raising the minimum
 accepted client version is a source change to `MinClientVersion` in
 [internal/daemon/server.go](../internal/daemon/server.go).
 
