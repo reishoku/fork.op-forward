@@ -33,10 +33,12 @@ go test ./...
 ### Report card
 
 A report card (formatting, `go vet`, golangci-lint, gosec, govulncheck, and
-test coverage) runs on every pull request and is published for the main branch.
+test coverage) runs on every pull request and is published for the `reishoku` branch.
 Run `scripts/build-report-card.sh <dir>` to reproduce it locally; it needs
 `golangci-lint`, `gosec`, and `govulncheck` on your PATH. The gate fails the
-build on test failures or reachable vulnerabilities. Lint and gosec findings
+build on test failures, reachable vulnerabilities, a package below its coverage
+floor, or a coverage drop against the published report (see
+[docs/development.md](docs/development.md#report-card-workflow)). Lint and gosec findings
 lower the grade without blocking.
 
 ## Test-first development

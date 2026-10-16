@@ -2,7 +2,7 @@ VERSION ?= 0.3.0
 BINARY  := op-forward
 LDFLAGS := -s -w -X github.com/reishoku/fork.op-forward/cmd.Version=$(VERSION)
 
-.PHONY: build build-all clean test
+.PHONY: build build-all check-docs clean test
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o $(BINARY) .
@@ -19,6 +19,9 @@ build-all: clean
 
 test:
 	go test ./...
+
+check-docs:
+	go run scripts/check-docs.go
 
 clean:
 	rm -rf $(BINARY) dist/

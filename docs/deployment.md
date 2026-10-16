@@ -10,7 +10,7 @@ details are in [cli.md](cli.md); variables are in
 | Topology | Transport | Section |
 |---|---|---|
 | VM or server reached over SSH, forwarded port | TCP | [TCP port](#tcp-port) |
-| VM or server reached over SSH, forwarded socket | Unix socket | [Unix socket](#unix-socket) |
+| VM or server reached over SSH, forwarded socket | Unix socket | [Unix socket](#unix-socket-default) |
 | Colima or Lima VM | TCP or Unix socket over the VM's SSH config | [Colima and Lima](#colima-and-lima) |
 | Docker Desktop container | TCP to `host.docker.internal` | [Docker Desktop containers](#docker-desktop-containers) |
 
@@ -43,7 +43,8 @@ op-forward serve
 
 This listens on the Unix socket `~/Library/Caches/op-forward/op-forward.sock`
 (`$XDG_RUNTIME_DIR/op-forward.sock` when `XDG_RUNTIME_DIR` is set) and writes
-tokens to `~/Library/Caches/op-forward`. Use it for testing. To select another
+tokens to `~/Library/Caches/op-forward` (`$XDG_STATE_HOME/op-forward` when
+`XDG_STATE_HOME` is set). Use it for testing. To select another
 socket or loopback TCP:
 
 ```bash
@@ -73,8 +74,9 @@ Because launchd does not inherit your shell environment:
   `--listen` in the plist; to change it, export `OP_FORWARD_LISTEN` (or
   `OP_FORWARD_PORT` / `OP_FORWARD_SOCKET_PATH`) and run `service install`
   again;
-- `OP_FORWARD_TOKEN_DIR` and `OP_FORWARD_TOKEN_FILE` are not copied, so the
-  service uses the default token directory;
+- `OP_FORWARD_TOKEN_DIR`, `OP_FORWARD_TOKEN_FILE`, and `XDG_STATE_HOME` are not
+  copied, so the service uses `~/Library/Caches/op-forward`; a foreground
+  `serve` with `XDG_STATE_HOME` set uses a different directory;
 - the service runs with `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
   so `op` must be installed in one of those directories.
 
@@ -171,7 +173,8 @@ recorded binary path and preserving ownership. A shim anywhere else needs
 ## Token deployment
 
 Each remote machine needs the host's current `refresh.token`. Copy it into the
-remote token directory (`~/.cache/op-forward` on Linux):
+remote token directory (`~/.cache/op-forward` on Linux, or
+`$XDG_STATE_HOME/op-forward` when `XDG_STATE_HOME` is set there):
 
 ```bash
 ssh <vm> 'mkdir -p -m 700 ~/.cache/op-forward'
@@ -409,8 +412,9 @@ sequences that reach the remote caller unchanged. See
 
 `op-forward update` reports `daemon did not come back on ...`. Check the log,
 and restart with `launchctl kickstart -k gui/$(id -u)/com.op-forward.daemon`.
-Also confirm the `OP_FORWARD_LISTEN` or `OP_FORWARD_PORT` in the shell that ran
-`update` matches the service's endpoint.
+Also confirm that `OP_FORWARD_LISTEN`, `OP_FORWARD_PORT`,
+`OP_FORWARD_SOCKET_PATH`, and `XDG_RUNTIME_DIR` in the shell that ran `update`
+resolve to the service's endpoint.
 
 ## See also
 

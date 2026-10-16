@@ -1,14 +1,14 @@
 # Development
 
 This page covers building and testing op-forward, the packaging pipeline, the
-package repositories, and the release and recovery workflows. The current release
-line is v1.x (latest tag v1.0.0).
+package repositories, and the release and recovery workflows. The code is merged
+from upstream v1.0.0; the fork has not published a release of its own yet.
 
 ## Requirements
 
 | Tool | Needed for | Source of the requirement |
 |---|---|---|
-| Go 1.27 | Building and testing | `go 1.27.0` in [go.mod](../go.mod); CI reads the version from it |
+| Go 1.27.2 | Building and testing | `go 1.27.2` in [go.mod](../go.mod); CI reads the version from it |
 | make | Convenience targets | [Makefile](../Makefile) |
 | nfpm 2.47.0 | Building Linux packages | Pinned and checksummed in [release.yml](../.github/workflows/release.yml) |
 | Docker | Package install tests, the Alpine repository, AUR verification | [scripts/test-packages.sh](../scripts/test-packages.sh), [scripts/build-apk-repo.sh](../scripts/build-apk-repo.sh), [scripts/build-aur.sh](../scripts/build-aur.sh) |
@@ -45,10 +45,20 @@ Checks to run before submitting a change:
 gofmt -l .        # prints files that need formatting; should print nothing
 go vet ./...
 go test ./...
+go run scripts/check-docs.go   # or: make check-docs
 ```
 
-The CI workflow ([ci.yml](../.github/workflows/ci.yml)) runs `go vet ./...` and
-`go test ./...` on pushes and pull requests to `reishoku`. It does not run `gofmt`.
+The CI workflow ([ci.yml](../.github/workflows/ci.yml)) runs `go vet ./...`,
+`go test ./...`, and `go run scripts/check-docs.go` on pushes and pull requests
+to `reishoku`. It does not run `gofmt`.
+
+[scripts/check-docs.go](../scripts/check-docs.go) fails when the Markdown
+documentation refers to something that no longer exists: a relative link or
+its `#anchor`, a repository path in a code span (such as
+`internal/auth/token.go`), or a Go identifier of this module written as
+`package.Name` or `Type.Method` (such as `endpoint.DefaultSocketPath`). It
+does not fetch external URLs. Writing references in those forms keeps them
+checked; prose describing behavior still has to be kept accurate by hand.
 
 Test files sit beside the code they cover:
 
@@ -130,6 +140,7 @@ Pages at `https://reishoku.github.io/fork.op-forward`.
 | `/rpm` | dnf, yum, zypper | `rpm/<arch>/*.rpm`, `rpm/<arch>/repodata/` (plus `repomd.xml.asc` when signed), `rpm/op-forward.repo` |
 | `/apk` | apk | `apk/<arch>/*.apk`, `apk/<arch>/APKINDEX.tar.gz`, `apk/op-forward.rsa.pub` |
 | `/index.html` | Landing page | Install commands for every repository |
+| `/report` | Report card | `index.html`, `badge.json`, `coverage.json`, published by [report-card.yml](../.github/workflows/report-card.yml) |
 
 ### Building the repositories
 
@@ -258,10 +269,25 @@ input `confirm` to be exactly `republish`. Steps:
 Use it after a deleted or damaged `gh-pages` branch, a Pages site that was turned
 off, or an index that omits published versions.
 
+## Report card workflow
+
+[report-card.yml](../.github/workflows/report-card.yml) runs on pushes and pull
+requests to `reishoku`, weekly (Monday 05:17 UTC), and on manual dispatch. It
+runs [scripts/build-report-card.sh](../scripts/build-report-card.sh) twice: once
+to build the report (formatting, `go vet`, golangci-lint, gosec, govulncheck,
+coverage) and once with `--gate`, which fails on test failures, reachable
+vulnerabilities, a package below its coverage floor (main 85, cmd 98,
+internal/auth 98, internal/daemon 95, internal/endpoint 93, internal/executor
+97, internal/version 100), or a package more than 0.5 points below its value in
+the published `coverage.json` (the ratchet, skipped when that file is
+unreachable and never applied to main). Lint and gosec findings lower the grade
+without blocking. Only a push to `reishoku` publishes the report to
+`gh-pages` under `/report`.
+
 ## Versioning and tagging
 
-Releases are tags of the form `vMAJOR.MINOR.PATCH` (upstream tags `v0.7.0` through
-`v0.7.3` exist at this writing). Pushing the tag starts the release workflow, and
+Releases are tags of the form `vMAJOR.MINOR.PATCH` (upstream tags up to `v1.0.0`
+exist at this writing). Pushing the tag starts the release workflow, and
 the tag without its `v` is stamped into the binaries and used in package versions.
 Use plain numeric tags. The daemon's comparison ignores a SemVer suffix (see
 [protocol.md](protocol.md#version-negotiation)), but the packaging does not
@@ -271,7 +297,8 @@ below `0.7.3`; makepkg rejects a hyphen in `pkgver`; apk rejects both `-` and
 [scripts/test-packages.sh](../scripts/test-packages.sh) builds file names from
 the raw version.
 
-Fork releases use plain `X.Y.Z` tags in a series that does not collide with
+Fork releases use plain numeric `vX.Y.Z` tags (the release workflow starts only
+on tags matching `v*`) in a series that does not collide with
 upstream's tags, so a fork release never shares a tag with a different upstream
 release. The series is chosen at the first fork release, and the release notes
 name the upstream version each fork release is based on. Raising the minimum
@@ -299,9 +326,9 @@ remains different from upstream `main`:
 
 | Area | Fork behavior | Where |
 |---|---|---|
-| Default endpoint | Unix socket at `endpoint.DefaultSocketPath` (`OP_FORWARD_SOCKET_PATH`, `$XDG_RUNTIME_DIR`, or the cache directory) on both sides; TCP only when `--port`/`--host`, `OP_FORWARD_PORT`/`OP_FORWARD_HOST`, or a `tcp://` endpoint is given. Upstream defaults to `tcp://127.0.0.1:18340` | [internal/endpoint/config.go](../internal/endpoint/config.go), [cmd/config.go](../cmd/config.go) |
+| Default endpoint | Unix socket at `endpoint.DefaultSocketPath` (`OP_FORWARD_SOCKET_PATH`, `$XDG_RUNTIME_DIR`, or the cache directory) on both sides; TCP only when `--port`/`OP_FORWARD_PORT` (daemon or proxy), `--host`/`OP_FORWARD_HOST` (proxy only), or a `tcp://` endpoint is given. Upstream defaults to `tcp://127.0.0.1:18340` | [internal/endpoint/config.go](../internal/endpoint/config.go), [cmd/config.go](../cmd/config.go) |
 | Token directory | `$XDG_STATE_HOME/op-forward` is preferred over the cache directory when `XDG_STATE_HOME` is set | [internal/auth/token.go](../internal/auth/token.go) |
-| Token file I/O | Reads and writes go through `os.Root` confined to the token file's directory | [internal/auth/token.go](../internal/auth/token.go) |
+| Token file I/O | The daemon's reads and writes (`auth.SaveToPath`, `auth.LoadFromPath`) go through `os.Root` confined to the token file's directory; the proxy's token cache in [cmd/proxy.go](../cmd/proxy.go) uses plain file I/O | [internal/auth/token.go](../internal/auth/token.go) |
 | Workflow actions | Every `uses:` is pinned to a full commit SHA with the release tag in a comment, because the fork's Actions policy rejects tag references; upstream uses major tags (`@v6`) | [.github/workflows/](../.github/workflows) |
 | Repository references | `ekovshilovsky/op-forward` → `reishoku/fork.op-forward` (Go module path, badges, releases, install script, Homebrew tap, package repositories on Pages, AUR source URLs); maintainer and security-contact references are unchanged | throughout |
 

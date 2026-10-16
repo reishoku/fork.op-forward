@@ -234,7 +234,8 @@ OpenSSH documentation, a multiplexed session reuses the first connection, so
 
 ```bash
 # Host: the daemon binds its default socket
-# (~/Library/Caches/op-forward/op-forward.sock unless XDG_RUNTIME_DIR is set)
+# (~/Library/Caches/op-forward/op-forward.sock unless OP_FORWARD_SOCKET_PATH
+# or an absolute XDG_RUNTIME_DIR is set)
 op-forward serve
 
 # Host: forward it. The VM-side path is spelled out because the host shell
@@ -259,8 +260,10 @@ Points to know:
 - **Path lengths.** See [Socket path length](#socket-path-length).
 - **Host-side rules.** The host path must satisfy the directory and permission
   rules above. `~/Library/Caches/op-forward` on macOS satisfies them because the
-  daemon creates it with mode 0700 when it writes the token files, provided the
-  directory did not already exist with looser permissions.
+  daemon creates it with mode 0700 if it does not exist (`Endpoint.Listen`
+  creates the socket's parent directory, and when the token directory is the
+  cache directory the token writes create it first), provided the directory did
+  not already exist with looser permissions.
 
 The `ssh` and `sshd` options named here are OpenSSH behavior as documented by
 OpenSSH, not behavior implemented in this repository.

@@ -3,8 +3,9 @@
 op-forward forwards 1Password CLI (`op`) commands from VMs, containers, and
 remote SSH sessions to a macOS host, where the real `op` runs and the 1Password
 desktop application handles biometric approval (Touch ID). The top-level [README](../README.md) is the quick start;
-the pages here are the reference. They describe the code at the current release
-line (v0.7.x), and where a page and the code disagree, the code is correct.
+the pages here are the reference. They describe the code merged from upstream
+v1.0.0 (the fork has not published a release of its own yet), and where a page
+and the code disagree, the code is correct.
 
 ## Reading order
 
