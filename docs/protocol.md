@@ -275,7 +275,7 @@ daemon (on `/op/execute` only, after authentication) evaluates it with
 
 | Client version | Result |
 |---|---|
-| Empty, or `dev` | No check; the request proceeds |
+| Empty, `dev`, or anything without a numeric core | No check; the request proceeds |
 | Below `MinClientVersion` | `426 Upgrade Required` with `X-Update-Available` set to the daemon's version |
 | At or above the minimum but below the daemon's version | Request proceeds; response carries `X-Update-Available` |
 | Equal to or above the daemon's version | Request proceeds; no header |
@@ -288,10 +288,13 @@ If the header is absent, the check is skipped entirely and no
 changing that value and releasing a new daemon; nothing reads it from the
 environment or a flag.
 
-Versions are compared as `major.minor.patch`. A leading `v` is ignored. Missing
-components count as 0. A component that is not a plain integer, including a
-pre-release suffix such as `1.2.3-rc1`, makes the whole version compare as
-`0.0.0`. A daemon built without a version (`dev`) compares as `0.0.0`, so it
+Versions are compared as `major.minor.patch`. A leading `v` is ignored, and so
+is a SemVer pre-release or build suffix (`1.2.3-rc.1` and `1.2.3+build.5`
+compare as `1.2.3`). Missing components count as 0. A version with more than
+three components or a component that is not a non-negative integer has no
+numeric core: as a client version it is exempt from the check, like `dev`,
+rather than being compared as `0.0.0` and rejected with `426`; as the daemon's
+own version it compares as `0.0.0`. A daemon built without a version (`dev`) compares as `0.0.0`, so it
 does not report an update to a client that is at or above the minimum version.
 The one exception is the `426` response: when a client below the minimum
 triggers it, the daemon sets `X-Update-Available` to its own version even if
