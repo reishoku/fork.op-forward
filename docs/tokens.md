@@ -1,215 +1,273 @@
 # Token model
 
-This page documents the access/refresh token model added in v0.3.0 and the
-on-disk format the proxy and daemon agree on. The HTTP shape of the refresh
-endpoint lives in [`protocol.md` § /token/refresh](protocol.md#post-tokenrefresh);
-the security framing lives in [`security.md`](security.md).
-
-Source of truth: [`internal/auth/token.go`](../internal/auth/token.go).
+op-forward authenticates every `/op/execute` request with a bearer token. The
+tokens are credentials for the op-forward daemon only; they are unrelated to
+1Password credentials, and they do not grant access to anything except the
+ability to ask the daemon to run `op` (any approval prompt is then governed by
+the 1Password desktop application on the host, not by these tokens). The implementation is in [internal/auth/token.go](../internal/auth/token.go),
+the client logic in [cmd/proxy.go](../cmd/proxy.go), and the refresh handler in
+[internal/daemon/server.go](../internal/daemon/server.go).
 
 ## Two-tier design
 
-op-forward stores two distinct tokens:
+| | Access token | Refresh token |
+|---|---|---|
+| Used for | `POST /op/execute` | `POST /token/refresh` |
+| Lifetime | 1 hour (`AccessTokenTTL`) | 30 days (`RefreshTokenTTL`) |
+| Generated | On every daemon start, and on every refresh | On first start, when the stored one is missing or expired, and on every refresh |
+| File | `access.token` | `refresh.token` |
+| Rotated by refresh | Yes | Yes |
 
-| Name            | Filename          | TTL                              | Lifetime characteristics |
-|-----------------|-------------------|----------------------------------|--------------------------|
-| Access token    | `access.token`    | 1 hour (`AccessTokenTTL`)        | Regenerated on every `op-forward serve` startup. Used for `/op/execute`. |
-| Refresh token   | `refresh.token`   | 30 days sliding (`RefreshTokenTTL`) | Persists across daemon restarts. Used to mint new access tokens via `/token/refresh`. Rotated to a new value on every successful refresh. |
-| Legacy token    | `session.token`   | (mirrors access TTL)             | Kept in sync with `access.token` for backward compatibility with old proxy clients. Migrated to `refresh.token` once on first run via `auth.MigrateLegacyToken`. |
+Both tokens are 32 random bytes from `crypto/rand`, written as 64 hexadecimal
+characters. The daemon holds exactly one access token and one refresh token in
+memory. A request is authenticated by comparing the presented bearer value with
+the in-memory value in constant time and checking that the token has not expired.
+An access token is not accepted by `/token/refresh`, and a refresh token is not
+accepted by `/op/execute`.
 
-Why two? A single 30-day token used directly for execution would mean any leak
-gives the attacker a month of access. Splitting into a short-lived access
-token plus a long-lived refresh token keeps the high-value secret out of the
-hot path: only `/token/refresh` ever sees the refresh token, and a successful
-refresh rotates it.
+The short access lifetime limits the usefulness of a leaked access token. The
+refresh token lets a client obtain new tokens after the daemon restarts or the
+access token expires, without anyone redeploying files.
 
-## Format on disk
+## File format
 
-Each token file is two lines, written atomically:
-
-```
-<64-hex-character-token-value>
-<RFC3339 expiry timestamp>
-```
-
-Example:
+A token file has two lines:
 
 ```
-6f7d9c3b1e0a4d2f8e5b1a0c9f7e6d4b2a1c8f5d3b7e9a0c1d2e4f5a6b7c8d9e
-2026-12-04T12:34:56+09:00
+<64 hexadecimal characters>
+<expiry as RFC 3339, for example 2026-10-16T14:30:00-07:00>
 ```
 
-Properties:
+Files are written atomically (to `<name>.tmp`, then renamed) with mode 0600, and
+missing parent directories are created with mode 0700. The daemon-side reads and
+writes (`auth.SaveToPath`, `auth.LoadFromPath`) go through Go's `os.Root`, opened
+on the token file's directory, so the staging file, the rename, and the read
+cannot resolve outside that directory, including through a symlink. The daemon and the proxy
+write the same format, and the proxy treats a file without a parseable expiry
+line as expired. The lifetime (TTL) itself is not stored on disk.
 
-- 32 random bytes from `crypto/rand`, hex-encoded → 64 ASCII chars
-  (`auth.TokenLength = 32`).
-- Mode `0600`, written as `<basename>.tmp` then `Rename`d into place.
-- Both write and read go through `os.OpenRoot(dir)` so symlinks pointing
-  outside `dir` and `..` components in the basename are refused. This is the
-  CWE-22 mitigation referenced in [`security.md`](security.md).
+## File locations and precedence
 
-## Directory and file precedence
+The token directory is resolved as follows, identically on the daemon and the
+proxy side (both call into the `auth` package):
 
-Resolution lives in `auth.TokenDir` and the `*Path` helpers.
+1. `OP_FORWARD_TOKEN_DIR`, if set.
+2. `$XDG_STATE_HOME/op-forward`, if `XDG_STATE_HOME` is set.
+3. Otherwise the operating system's user cache directory plus `op-forward`:
+   `~/Library/Caches/op-forward` on macOS, and `$XDG_CACHE_HOME/op-forward` or
+   `~/.cache/op-forward` on Linux.
 
-**Token directory** (`auth.TokenDir`):
+Within that directory:
 
-1. `OP_FORWARD_TOKEN_DIR` — used verbatim, just `filepath.Clean`ed.
-2. `XDG_STATE_HOME` — yields `$XDG_STATE_HOME/op-forward`.
-3. `os.UserCacheDir()` — yields `<cache>/op-forward`. Linux falls back to
-   `~/.cache`; macOS uses `~/Library/Caches`.
+| File | Contents |
+|---|---|
+| `access.token` | Access token |
+| `refresh.token` | Refresh token |
+| `session.token` | Legacy file; see [Legacy token migration](#legacy-token-migration) |
 
-**Per-file paths**:
+`OP_FORWARD_TOKEN_FILE`, if set, replaces the full path of the access token
+file only. The refresh token and legacy file always live in the token
+directory. Because the daemon and the proxy resolve paths the same way, setting
+the variable affects where each side reads and writes its access token.
 
-| File              | Function              | Notes |
-|-------------------|-----------------------|-------|
-| `access.token`    | `auth.AccessTokenPath`  | Honors `OP_FORWARD_TOKEN_FILE` as a *full path* override. |
-| `refresh.token`   | `auth.RefreshTokenPath` | **Does not** honor `OP_FORWARD_TOKEN_FILE`. Always inside `TokenDir()`. |
-| `session.token`   | `auth.LegacyTokenPath`  | Same — always inside `TokenDir()`. |
+If the user cache directory cannot be determined (for example when `HOME` is
+unset), the proxy builds the path from the home directory lookup, whose error it
+ignores. With no home directory the result is the relative path
+`.cache/op-forward/<file>`, which resolves against the proxy's current working
+directory rather than a fixed location.
 
-The `OP_FORWARD_TOKEN_FILE` override is a backward-compat hook for the
-single-token era. It only redirects the access token; covered by
-[`cmd/proxy_test.go`](../cmd/proxy_test.go).
-
-For the full table see [`configuration.md` § Tokens](configuration.md#tokens).
+The launchd service does not copy the installing shell's environment, so
+`OP_FORWARD_TOKEN_DIR` and `OP_FORWARD_TOKEN_FILE` exported before
+`op-forward service install` are not seen by the service. Only the endpoint is
+resolved at install time (see [deployment.md](deployment.md#launchd-service)).
 
 ## Daemon startup
 
-`runServe` ([`cmd/serve.go`](../cmd/serve.go)) does the following on every
-start:
+`op-forward serve` performs these steps in order
+([cmd/serve.go](../cmd/serve.go)):
 
-1. **Migrate legacy.** `auth.MigrateLegacyToken` looks for `session.token`. If
-   `refresh.token` does not yet exist *and* the legacy file is still valid, it
-   copies the legacy value into `refresh.token` (with `RefreshTokenTTL`) so
-   users upgrading from the single-token era keep working without
-   redeployment. If `refresh.token` already exists, it is left alone — the
-   legacy file is never allowed to overwrite a current refresh token.
-2. **Load or generate refresh.** `auth.LoadOrGenerateRefresh` reads
-   `refresh.token` and, if it parses and is unexpired, reuses it. Otherwise a
-   fresh 30-day token is minted and written.
-3. **Generate a new access token.** `auth.GenerateAccess` always produces a
-   fresh access token on startup; it is not loaded from disk. The new token
-   is written to `access.token`.
-4. **Mirror to legacy.** The same access value is also written to
-   `session.token` so older proxy clients that still read the legacy path keep
-   working until upgraded.
+1. Resolve the endpoint. An invalid endpoint stops startup before any token is
+   written.
+2. Run `MigrateLegacyToken` (see below). A migration error is printed as a
+   warning and startup continues.
+3. Load the refresh token with `LoadOrGenerateRefresh`. If `refresh.token`
+   exists, parses, and has not expired, it is reused with its stored expiry;
+   otherwise a new refresh token is generated and saved. The daemon prints either
+   `Refresh token reused (expires ...)` or `Refresh token generated (no valid
+   existing token found)`, followed by the file path.
+4. Generate a new access token, save it to the access token path, and print its
+   path and expiry. A previously issued access token never survives a restart.
+5. Write the same access token to `session.token`, ignoring failures, so that
+   clients that still read the legacy file continue to work.
+6. Open the listener and serve.
 
-The daemon then constructs `Server` with both tokens and calls `Start`.
+The daemon reads token files only at startup. After that, authentication uses
+the in-memory values; editing or deleting the files on the host does not change
+which tokens the running daemon accepts.
 
-## Proxy request flow
+## Client request flow
 
-[`cmd/proxy.go`](../cmd/proxy.go) handles the access/refresh dance:
+`op-forward proxy` ([cmd/proxy.go](../cmd/proxy.go)) works as follows:
 
-1. Read the *value* and the *on-disk expiry* of `access.token`. If missing,
-   try `session.token`. If both are missing, error out with a "no token"
-   message and exit `127`.
-2. Probe the Unix socket. If it does not respond, exit `127` (lets the bash
-   shim fall back to a real `op`).
-3. If the access token's on-disk expiry is in the past, skip directly to step
-   5. This avoids burning a round-trip and a Touch ID prompt just to discover
-   what we already know.
-4. Otherwise, send `POST /op/execute` with `Authorization: Bearer <access>`.
-   On `200`, relay output and exit. On `401`, fall through.
-5. Read `refresh.token` (falling back to `session.token`). If neither exists,
-   exit `127` with the "no token" message.
-6. Send `POST /token/refresh` with `Authorization: Bearer <refresh>`. On
-   `200`, parse the new pair, persist both files atomically, retry step 4
-   once with the new access token. On non-`200`, print an actionable error
-   and exit `127`.
+1. Read `access.token` (or the path in `OP_FORWARD_TOKEN_FILE`). If it is absent,
+   read `session.token` instead.
+2. If neither file yields a value, check that `refresh.token` has a value. If it
+   does not, print the "no authentication token found" error and exit 127. The
+   same error is printed later, at the refresh step, whenever a refresh is needed
+   and neither `refresh.token` nor `session.token` supplies a value.
+3. Probe the endpoint; exit 127 if nothing answers.
+4. If an access token was read and its stored expiry is in the future, send the
+   request with it.
+5. If there was no usable access token, or the daemon answered 401, read
+   `refresh.token` (falling back to the value in `session.token`) and call
+   `POST /token/refresh`.
+6. On success, write the new access token and new refresh token to their files
+   and repeat the original request once with the new access token.
+7. If the refresh fails, print the "token refresh failed" error and exit 127.
 
-The retry happens *once*. A second `401` after a successful refresh is
-treated as a hard failure rather than a refresh loop.
+An access token known to be expired is not sent; the proxy refreshes first
+instead of spending a round trip on a 401. The proxy does not update
+`session.token`; only the daemon does.
 
-## Refresh endpoint behaviour
+## Refresh endpoint behavior
 
-[`Server.handleTokenRefresh`](../internal/daemon/server.go):
+`POST /token/refresh` validates the bearer value against the daemon's current
+refresh token (constant-time comparison plus an expiry check). On success, while
+holding the daemon's token lock, it:
 
-- Method must be `POST`; otherwise `405`.
-- `Authorization` must carry a Bearer token; otherwise `401`.
-- The Bearer value is compared against the in-memory refresh token using
-  `hmac.Equal` (constant-time). The refresh token must also be unexpired.
-- On mismatch or expiry, returns `401` with body
-  ```json
-  { "error": "refresh_token_expired",
-    "message": "op-forward: authentication expired — …" }
-  ```
-  The message text is verbose on purpose: it tells the user the failure is
-  *not* a 1Password authentication problem and points at the redeploy fix.
-- On success:
-  - Mints a new access token (1 hour TTL).
-  - Mints a *new* refresh token (30 days TTL) — the old refresh token's value
-    is no longer accepted from this point.
-  - Persists both files via `auth.SaveToPath`.
-  - Mirrors the new access token into `session.token` for old clients.
-  - Atomically swaps the in-memory tokens under `Server.mu` so concurrent
-    `/op/execute` requests see the new access token immediately.
-  - Returns 200 with body
-    ```json
-    { "access_token": "...", "access_expires": "RFC3339",
-      "refresh_token": "...", "refresh_expires": "RFC3339" }
-    ```
+1. generates a new access token (1 hour) and a new refresh token (30 days);
+2. writes `access.token`, `refresh.token`, and `session.token` on the host (a
+   write failure is logged as a warning and does not fail the request);
+3. replaces both in-memory tokens;
+4. returns all four values (see [protocol.md](protocol.md#refresh-endpoint)).
 
-The mutex (`Server.mu`) is held for the duration of validation, generation,
-disk write, and the in-memory swap. This makes refresh atomic with respect to
-authentication checks, but it also means a slow disk write briefly serializes
-incoming `/op/execute` calls. In practice the disk write is microseconds.
+The old refresh token and the old access token stop working at that moment.
+The request and response shapes and status codes are in
+[protocol.md](protocol.md#refresh-endpoint).
 
-## Sliding expiry
+Because the daemon keeps a single token pair, rotation is global. Every client
+that should keep working must end up holding the pair the daemon issued most
+recently. Two clients that hold the same stale refresh token race: the first to
+refresh succeeds and rotates the pair; the second presents a value the daemon no
+longer holds and receives 401. The same applies to clients on different
+machines that were each given a copy of the token files: after one of them
+refreshes, the others hold tokens the daemon no longer accepts until new files
+are deployed to them. Clients that share one token directory (for example the
+same user account on one VM) see each other's refreshed files.
 
-The phrase "sliding 30-day expiry" means: as long as the refresh token is
-used at least once every 30 days, you stay authenticated. The mechanism is
-*rotation*: each successful `/token/refresh` returns a brand-new refresh
-token whose own 30-day window starts now.
+## Expiry
 
-This is intentionally different from `Token.Renew()`, which extends the
-existing token's expiry in place. `Renew()` exists in the API but is not
-called by the daemon's `/token/refresh` path. The daemon always rotates;
-`Renew()` is retained for callers that want pre-emptive in-place renewal
-without changing the token value (currently none in tree).
+Token expiry is fixed when a token is issued:
 
-`Token.ShouldRenew` returns true when less than half the TTL is remaining
-(`RenewalFactor = 0.5`). It is also unused in the production code path
-today; the proxy is purely 401-driven. Treat both as future-API hooks.
+- An access token expires one hour after it was generated. Nothing extends it;
+  once it has expired the client refreshes.
+- A refresh token expires 30 days after it was generated. Its expiry moves
+  forward when `/token/refresh` issues a replacement, and at no other time. A
+  daemon restart reuses the stored refresh token with its stored expiry.
+
+`ShouldRenew` and `Renew` exist in the `auth` package, but neither the daemon
+nor the proxy calls them. Use extends the refresh token's lifetime only
+indirectly: any command issued after the access token has expired causes a
+refresh, which issues a new 30-day refresh token. A client that issues no
+commands for more than 30 days after its last refresh holds an expired refresh
+token.
+
+When the daemon's refresh token has expired and the daemon is not restarted,
+refresh requests fail with `refresh_token_expired`. After a restart, the expired
+token is replaced by a newly generated one, which clients do not have.
+
+## Legacy token migration
+
+Before the two-tier model, op-forward used a single token in `session.token`.
+`MigrateLegacyToken` runs at daemon startup. If `refresh.token` does not exist
+and `session.token` exists, parses, and has not expired, the legacy value and
+expiry are saved as `refresh.token`. If `refresh.token` already exists, nothing
+is migrated.
+
+On the client side, the proxy accepts the legacy file in two roles:
+
+- as an access token when `access.token` is missing (the daemon's access token
+  differs from the legacy value, so the first request returns 401 and triggers a
+  refresh);
+- as a refresh token when `refresh.token` is missing, which succeeds when the
+  daemon promoted that same value during migration.
+
+The effect is that a VM holding only the old `session.token` recovers
+automatically after the host is upgraded and restarted, and writes the new
+`access.token` and `refresh.token` on its first request. New deployments should
+use `refresh.token`; the legacy file exists for compatibility.
 
 ## Failure modes
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `op-forward: no authentication token found.` | Neither `access.token` / `session.token` nor `refresh.token` exists on the VM. | Re-run your token deployment script. The error message includes the canonical `scp` command. |
-| `op-forward: token refresh failed — refresh_token_expired` | Refresh token has not been used in over 30 days *or* the daemon was restarted with a new refresh token while the VM still holds the old one. | Re-deploy `refresh.token` from the host. Restarting the daemon does **not** invalidate an existing refresh token, but generating a new one from scratch (e.g. the host token directory was wiped) does. |
-| `401 Unauthorized` on `/op/execute` followed by another `401` after refresh | Clock skew between host and VM, or the refresh token is good but the access token write raced with the retry. | Inspect `access.token` content vs the expected expiry. The most common cause is a stale token cached in `session.token` taking precedence — delete `session.token` so the proxy falls back to `access.token`. |
-| `tunnel not available` on `op-forward proxy` | The Unix socket forwarding is not in place. | See [`deployment.md` § Troubleshooting](deployment.md#troubleshooting). |
-| Old client still logs in fine even after access token expires | The `session.token` mirror is still being written by the daemon. The path is intentional. Update the client to pick up the two-tier flow when convenient. | n/a (compat path). |
+### token refresh failed
 
-## Security boundaries
+The proxy prints `op-forward: token refresh failed — <reason>` and exits 127,
+after which the shim falls back to the real `op`. Possible reasons and what
+they mean:
 
-- A token file with mode other than `0600` should be treated as compromised —
-  rotate by restarting the daemon (regenerates access; preserves refresh) or
-  by deleting `refresh.token` (forces a full re-mint on next start).
-- Tokens are never logged. The daemon's audit log redacts `--password` /
-  `-p` *values* but the token itself only appears in the `Authorization`
-  header, which is not logged.
-- The proxy's local cache writes (`saveTokenFile` in `cmd/proxy.go`) use a
-  `.tmp` + `Rename` pattern with mode `0600`. They do not go through
-  `os.Root` because the proxy is the simpler client side and only writes to
-  files it just resolved itself.
+| Reason shown | Cause |
+|---|---|
+| The `refresh_token_expired` message (starts `op-forward: authentication expired`) | The daemon returned 401 because the presented refresh value does not match its current refresh token, or its refresh token has expired. Typical causes: the daemon generated a new refresh token (its file was missing or expired at startup), the client holds a copy from another host, or another client refreshed first |
+| `refresh request failed: ...` | The request could not be completed, for example the tunnel dropped between the probe and the refresh |
+| `refresh returned HTTP N: ...` | The daemon returned another status, for example 403 from the peer check or 405 |
+| `parsing refresh response: ...` | The reply was not valid JSON |
 
-## Test coverage
+The message text stored in the daemon's 401 response refers to a refresh token
+unused for more than 30 days and a restarted daemon; the condition that
+produces the response is broader, as the first row states.
 
-Token behaviour is covered by:
+Remedy: copy the host's current `refresh.token` to the remote token directory,
+for example:
 
-- [`internal/auth/token_test.go`](../internal/auth/token_test.go) — generation,
-  TTL, save/load, atomic write, env-var overrides, legacy migration, refresh
-  generation.
-- [`internal/daemon/server_test.go`](../internal/daemon/server_test.go) — the
-  refresh endpoint, including: expired refresh, wrong refresh, refresh-token
-  rejected for `/op/execute`, sliding-expiry rotation.
-- [`cmd/proxy_test.go`](../cmd/proxy_test.go) — `OP_FORWARD_TOKEN_FILE`
-  override semantics (access only).
+```bash
+scp host:~/Library/Caches/op-forward/refresh.token ~/.cache/op-forward/refresh.token
+```
+
+No access token needs to be copied. On the next command the proxy sees no usable
+access token, refreshes, and writes both files. Do not copy the file to several
+machines expecting all of them to keep working; see [Refresh endpoint
+behavior](#refresh-endpoint-behavior).
+
+### no authentication token found
+
+The proxy needed a refresh token and could not find one. This happens in two
+situations:
+
+- no usable credential files exist: there is no `access.token` or
+  `session.token` value and no `refresh.token` value; or
+- an access token exists but is expired (or its expiry line is missing or
+  unparsable), so a refresh is required, and neither `refresh.token` nor
+  `session.token` supplies a value to refresh with.
+
+In both cases deploy `refresh.token` as above. The message says this is not a
+1Password problem; it concerns the op-forward credential files.
+
+### Daemon returns 401 for the access token
+
+This is the normal signal to refresh and is handled silently. If the retry with
+the new access token returns a non-200 status, the proxy handles it like any other
+reply: it prints `daemon returned HTTP N` with the status actually received and
+exits 127, and a 426 takes the upgrade-required branch (it prints the response
+body and exits 127). The status is not necessarily 401.
+
+## Revoking access
+
+The daemon accepts only the tokens it holds in memory. To invalidate everything
+a client may have copied:
+
+1. Stop the daemon.
+2. Delete `refresh.token` and `session.token` in the host's token directory.
+   Leaving `session.token` in place would let the migration described above
+   promote its value to the new refresh token.
+3. Start the daemon. It generates a new refresh token and a new access token.
+4. Deploy the new `refresh.token` to the clients that should keep access.
+
+Restarting the daemon without deleting `refresh.token` invalidates every access
+token but keeps the refresh token, so existing clients recover on their own.
 
 ## See also
 
-- [`protocol.md` § /token/refresh](protocol.md#post-tokenrefresh) — wire format
-- [`security.md` § Bearer-token authentication](security.md#3-bearer-token-authentication)
-- [`configuration.md` § Tokens](configuration.md#tokens)
-- [`deployment.md` § Token deployment](deployment.md#3-token-deployment)
+- [protocol.md](protocol.md#refresh-endpoint) for the refresh request and response
+- [security.md](security.md#3-bearer-tokens) for how tokens fit the threat model
+- [deployment.md](deployment.md#token-deployment) for deploying the files
+- [configuration.md](configuration.md) for the path variables

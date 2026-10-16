@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "v*"
+  # Dry run: exercises the whole pipeline with the real signing secrets
+  # (build, sign, install-test, generate every repository) but publishes
+  # nothing. The generated repositories and packages are uploaded as a
+  # workflow artifact for inspection instead.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to stamp on the dry-run build (no tag is created)
+        default: "0.0.0"
+        required: true
 
 permissions:
   contents: write
@@ -28,9 +38,31 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Resolve release version
+        env:
+          # The dispatch input is passed through the environment rather than
+          # interpolated into the script, so its value can never be executed
+          # as shell.
+          VERSION_INPUT: ${VERSION_INPUT}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            echo "TAG_NAME=v${VERSION_INPUT}" >> "$GITHUB_ENV"
+            echo "DRY_RUN=true" >> "$GITHUB_ENV"
+            echo "Dry run: building as v${VERSION_INPUT}, nothing will be published"
+          else
+            echo "TAG_NAME=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+            echo "DRY_RUN=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Build release binaries
         env:
-          TAG_NAME: ${{ github.ref_name }}
+          # Disable cgo so every Linux binary is statically linked. With cgo
+          # left at its default, the build that matches the runner's own
+          # architecture links against the runner's glibc and then fails on
+          # Alpine (musl) and on distributions with an older glibc, while the
+          # cross-compiled architecture comes out static. Nothing in this
+          # project needs cgo.
+          CGO_ENABLED: "0"
         run: |
           VERSION="${TAG_NAME#v}"
           LDFLAGS="-s -w -X github.com/reishoku/fork.op-forward/cmd.Version=${VERSION}"
@@ -39,33 +71,42 @@ jobs:
             ARCH=$(echo "$PAIR" | cut -d' ' -f2)
             DIR="op-forward_${VERSION}_${OS}_${ARCH}"
             mkdir -p "dist/${DIR}"
-            GOOS="$OS" GOARCH="$ARCH" go build -ldflags="${LDFLAGS}" -o "dist/${DIR}/op-forward" .
+            GOOS="$OS" GOARCH="$ARCH" go build -trimpath -ldflags="${LDFLAGS}" -o "dist/${DIR}/op-forward" .
             tar -czf "dist/${DIR}.tar.gz" -C "dist/${DIR}" op-forward
           done
 
+      - name: Verify Linux binaries are statically linked
+        run: |
+          for BIN in dist/op-forward_*_linux_*/op-forward; do
+            DESC=$(file "$BIN")
+            echo "$DESC"
+            case "$DESC" in
+              *"statically linked"*) ;;
+              *) echo "::error::$BIN is not statically linked; it would fail on Alpine and older glibc distributions"; exit 1 ;;
+            esac
+          done
+
       - name: Create release
+        if: env.DRY_RUN != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
         run: |
           gh release create "$TAG_NAME" dist/*.tar.gz \
             --title "$TAG_NAME" \
             --generate-notes
 
       - name: Update Homebrew formula
+        if: env.DRY_RUN != 'true'
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
         run: |
           VERSION="${TAG_NAME#v}"
-          SHA_DARWIN_ARM64=$(sha256sum "dist/op-forward_${VERSION}_darwin_arm64.tar.gz" | cut -d' ' -f1)
-          SHA_DARWIN_AMD64=$(sha256sum "dist/op-forward_${VERSION}_darwin_amd64.tar.gz" | cut -d' ' -f1)
-          SHA_LINUX_ARM64=$(sha256sum "dist/op-forward_${VERSION}_linux_arm64.tar.gz" | cut -d' ' -f1)
-          SHA_LINUX_AMD64=$(sha256sum "dist/op-forward_${VERSION}_linux_amd64.tar.gz" | cut -d' ' -f1)
-          FORMULA_PATH="${RUNNER_TEMP}/op-forward.rb"
-          TAP_DIR="${RUNNER_TEMP}/homebrew-tap"
+          SHA_DARWIN_ARM64=$(sha256sum dist/op-forward_${VERSION}_darwin_arm64.tar.gz | cut -d' ' -f1)
+          SHA_DARWIN_AMD64=$(sha256sum dist/op-forward_${VERSION}_darwin_amd64.tar.gz | cut -d' ' -f1)
+          SHA_LINUX_ARM64=$(sha256sum dist/op-forward_${VERSION}_linux_arm64.tar.gz | cut -d' ' -f1)
+          SHA_LINUX_AMD64=$(sha256sum dist/op-forward_${VERSION}_linux_amd64.tar.gz | cut -d' ' -f1)
 
-          cat > "${FORMULA_PATH}" <<FORMULA_EOF
+          cat > /tmp/op-forward.rb <<FORMULA_EOF
           class OpForward < Formula
             desc "Forward 1Password CLI across SSH boundaries with biometric auth"
             homepage "https://github.com/reishoku/fork.op-forward"
@@ -102,83 +143,171 @@ jobs:
           end
           FORMULA_EOF
 
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/reishoku/homebrew-tap.git" "${TAP_DIR}"
-          cp "${FORMULA_PATH}" "${TAP_DIR}/Formula/op-forward.rb"
-          cd "${TAP_DIR}"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/reishoku/homebrew-tap.git" /tmp/homebrew-tap
+          cp /tmp/op-forward.rb /tmp/homebrew-tap/Formula/op-forward.rb
+          cd /tmp/homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/op-forward.rb
           git diff --cached --quiet || git commit -m "Update op-forward to ${VERSION}"
           git push
 
-      - name: Build .deb packages
+      - name: Import package signing key
         env:
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          VERSION="${TAG_NAME#v}"
-          scripts/build-deb.sh "$VERSION" dist deb-out
-
-      - name: Build and publish APT repository
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
           GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
-          GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+          APK_PRIVATE_KEY: ${{ secrets.APK_RSA_PRIVATE_KEY }}
         run: |
-          VERSION="${TAG_NAME#v}"
-          APT_REPO="${RUNNER_TEMP}/apt-repo"
-
-          # Import the GPG signing key if available
+          mkdir -p -m 700 "$RUNNER_TEMP/keys"
+          # One PGP key signs the APT repository metadata, the RPM packages, and
+          # the RPM repository metadata. nfpm reads it from a file.
           if [ -n "${GPG_PRIVATE_KEY:-}" ]; then
             echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-            export GPG_KEY_ID
+            echo "$GPG_PRIVATE_KEY" > "$RUNNER_TEMP/keys/rpm-key.asc"
+            echo "NFPM_RPM_KEY_FILE=$RUNNER_TEMP/keys/rpm-key.asc" >> "$GITHUB_ENV"
+          fi
+          # Alpine requires an RSA key. Without it, apk packages are built
+          # unsigned and the Alpine repository is not published.
+          if [ -n "${APK_PRIVATE_KEY:-}" ]; then
+            echo "$APK_PRIVATE_KEY" > "$RUNNER_TEMP/keys/op-forward.rsa"
+            echo "NFPM_APK_KEY_FILE=$RUNNER_TEMP/keys/op-forward.rsa" >> "$GITHUB_ENV"
           fi
 
-          # Clone or initialize the gh-pages branch for the APT repo
-          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
+      - name: Build Linux packages (deb, rpm, apk, Arch)
+        env:
+          NFPM_VERSION: "2.47.0"
+          NFPM_SHA256: "0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783"
+        run: |
+          # Install nfpm from its prebuilt release, pinned by version and
+          # checksum. Building it with `go install` ties the release job to
+          # whatever Go version nfpm's module currently demands, which is
+          # unrelated to the toolchain this project pins in go.mod.
+          curl -fsSL -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "${NFPM_SHA256}  /tmp/nfpm.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+          nfpm --version | head -1
+          VERSION="${TAG_NAME#v}"
+          scripts/build-packages.sh "$VERSION" dist pkg-out
+
+      - name: Verify packages install on each distribution
+        run: scripts/test-packages.sh "${TAG_NAME#v}" pkg-out amd64
+
+      - name: Attach packages to the release
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG_NAME" pkg-out/*
+
+      - name: Publish to the AUR
+        # Skipped in dry runs: the PKGBUILD checksums the published release
+        # assets, which do not exist for a dry-run version. The AUR push
+        # itself only happens when an AUR account's SSH key is configured;
+        # otherwise the generated PKGBUILD is still verified and kept as a
+        # build artifact.
+        if: env.DRY_RUN != 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          VERSION="${TAG_NAME#v}"
+          scripts/build-aur.sh "$VERSION" aur-out --verify
+          if [ -z "${AUR_SSH_PRIVATE_KEY:-}" ]; then
+            echo "AUR_SSH_PRIVATE_KEY not set; PKGBUILD generated but not published"
+            exit 0
+          fi
+          mkdir -p -m 700 ~/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519,rsa aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          git clone -q ssh://aur@aur.archlinux.org/op-forward-bin.git /tmp/aur
+          cp aur-out/PKGBUILD aur-out/.SRCINFO /tmp/aur/
+          cd /tmp/aur
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet || git commit -m "Update to ${VERSION}"
+          git push origin HEAD:master
+
+      - name: Keep the generated PKGBUILD with the run
+        if: env.DRY_RUN != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-${{ env.TAG_NAME }}
+          path: aur-out/
+          retention-days: 30
+
+      - name: Publish package repositories (APT, RPM, Alpine)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+          BASE_URL: https://reishoku.github.io/fork.op-forward
+        run: |
+          VERSION="${TAG_NAME#v}"
+          sudo apt-get install -y -q createrepo-c >/dev/null
+
+          # The gh-pages branch hosts every repository under one site:
+          #   /            APT  (dists/, pool/, key.gpg)
+          #   /rpm         dnf  (<arch>/repodata, op-forward.repo)
+          #   /apk         apk  (<arch>/APKINDEX.tar.gz, op-forward.rsa.pub)
+          # A command substitution rather than `ls-remote | grep -q`: grep -q
+          # closes the pipe on its first match, ls-remote dies of SIGPIPE, and
+          # under pipefail the test reads false -- sending the run down the
+          # branch that re-initializes an orphan branch and discards the pool.
+          # GitHub's implicit `bash -e {0}` leaves it unarmed today, so adding
+          # `shell: bash` to this step is all it would take to lose the repo.
+          if [ -n "$(git ls-remote --heads origin gh-pages)" ]; then
             git clone --branch gh-pages --single-branch \
-              "https://x-access-token:${GH_TOKEN}@github.com/reishoku/fork.op-forward.git" "${APT_REPO}"
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" /tmp/repo
           else
-            mkdir -p "${APT_REPO}"
-            cd "${APT_REPO}"
-            git init
-            git checkout -b gh-pages
-            cd -
+            mkdir -p /tmp/repo
+            git -C /tmp/repo init -b gh-pages
           fi
 
-          # Build the APT repo from .deb packages
-          # Copy new .deb files into the pool (keep previous versions for users who haven't upgraded)
-          mkdir -p "${APT_REPO}/pool"
-          cp deb-out/*.deb "${APT_REPO}/pool/"
+          # Packages just built go in directly; build-repositories.sh then
+          # reconciles the rest of the tree against the published releases, so
+          # earlier versions survive a branch that was deleted or truncated
+          # rather than only a branch that happened to still be there.
+          mkdir -p /tmp/repo/pool /tmp/repo/rpm/x86_64 /tmp/repo/rpm/aarch64 /tmp/repo/apk/x86_64 /tmp/repo/apk/aarch64
+          cp pkg-out/*.deb /tmp/repo/pool/
+          cp pkg-out/*.x86_64.rpm /tmp/repo/rpm/x86_64/
+          cp pkg-out/*.aarch64.rpm /tmp/repo/rpm/aarch64/
+          if [ -n "${NFPM_APK_KEY_FILE:-}" ]; then
+            cp pkg-out/*_x86_64.apk /tmp/repo/apk/x86_64/
+            cp pkg-out/*_aarch64.apk /tmp/repo/apk/aarch64/
+          fi
 
-          scripts/build-apt-repo.sh "${APT_REPO}"
+          export GPG_KEY_ID
+          scripts/build-repositories.sh /tmp/repo "$BASE_URL" "$GITHUB_REPOSITORY"
 
-          # Add installation instructions as index page
-          cat > "${APT_REPO}/index.html" <<INDEXEOF
-          <!DOCTYPE html>
-          <html><head><title>op-forward APT Repository</title></head>
-          <body>
-          <h1>op-forward APT Repository</h1>
-          <pre>
-          # Add the repository
-          curl -fsSL https://reishoku.github.io/fork.op-forward/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/op-forward.gpg
-          echo "deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://reishoku.github.io/fork.op-forward stable main" | sudo tee /etc/apt/sources.list.d/op-forward.list
-          sudo apt-get update
-          sudo apt-get install op-forward
-          </pre>
-          </body></html>
-          INDEXEOF
-
-          # Commit and push to gh-pages
-          cd "${APT_REPO}"
+          if [ "$DRY_RUN" = true ]; then
+            echo "Dry run: repositories generated under /tmp/repo, not pushed"
+            exit 0
+          fi
+          cd /tmp/repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --cached --quiet || git commit -m "Update APT repo for v${VERSION}"
-
+          git diff --cached --quiet || git commit -m "Update package repositories for v${VERSION}"
           if git remote | grep -q origin; then
             git push origin gh-pages
           else
-            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/reishoku/fork.op-forward.git"
+            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             git push -u origin gh-pages
           fi
+
+      - name: Ensure the Pages site serves gh-pages
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/ensure-pages.sh "$GITHUB_REPOSITORY"
+
+      - name: Upload dry-run output
+        if: env.DRY_RUN == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-${{ inputs.version }}
+          path: |
+            pkg-out/
+            /tmp/repo/
+            !/tmp/repo/.git
+          retention-days: 7

@@ -1,346 +1,353 @@
 # HTTP protocol
 
-The daemon speaks HTTP/1.1 over a Unix domain socket. This page is the
-reference for the wire format. The transport layer it sits on is in
-[`transport.md`](transport.md); the auth tokens are in [`tokens.md`](tokens.md);
-the security framing is in [`security.md`](security.md).
-
-Source of truth: [`internal/daemon/server.go`](../internal/daemon/server.go),
-[`internal/executor/op.go`](../internal/executor/op.go),
-[`cmd/proxy.go`](../cmd/proxy.go).
+The daemon speaks plain HTTP/1.1 with JSON bodies. The protocol is identical
+over loopback TCP and over a Unix domain socket; see [transport.md](transport.md)
+for how the connection is made. For a Unix endpoint the request URL host is the
+placeholder `http://unix` and is ignored. The server is in
+[internal/daemon/server.go](../internal/daemon/server.go), the request and result
+types in [internal/executor/op.go](../internal/executor/op.go), and the client in
+[cmd/proxy.go](../cmd/proxy.go).
 
 ## Endpoints
 
-| Method | Path             | Auth                   | Peer-UID enforced | Body |
-|--------|------------------|------------------------|-------------------|------|
-| `GET`  | `/health`        | none                   | no                | none |
-| `POST` | `/op/execute`    | Bearer access token    | yes               | `executor.Request` JSON |
-| `POST` | `/token/refresh` | Bearer refresh token   | no                | none |
+| Path | Methods | Authentication | Purpose |
+|---|---|---|---|
+| `/health` | any | none | Liveness check |
+| `/op/execute` | `POST` | access token | Run an `op` command |
+| `/token/refresh` | `POST` | refresh token | Exchange the refresh token for a new pair |
 
-The base URL is `http://unix` — the host literal `unix` is a placeholder; the
-underlying connection is always the Unix socket dialed by the proxy. See
-[`transport.md` § HTTP-over-Unix client](transport.md#http-over-unix-client).
+Any other path returns the standard library's `404 page not found`. Every route
+and every unknown path sits behind the peer-uid middleware, so a Unix connection
+from another user receives `403 forbidden` before any handler runs (see
+[transport.md](transport.md#peer-credential-check)).
 
 ## Common headers
 
-Sent by the proxy on every request:
+Request headers sent by the proxy:
 
-| Header             | Value                              | Notes |
-|--------------------|------------------------------------|-------|
-| `Authorization`    | `Bearer <token>`                   | Required for `/op/execute` and `/token/refresh`. |
-| `User-Agent`       | `op-forward/<client version>`      | `<client version>` is the value of `cmd.Version` (`dev` for unstamped builds). |
-| `X-Client-Version` | `<client version>`                 | Used by the daemon's compatibility check. Same value as `User-Agent`'s suffix. |
-| `Content-Type`     | `application/json`                 | Sent on `/op/execute`. Optional but recommended. |
+| Header | Sent on | Meaning |
+|---|---|---|
+| `Authorization: Bearer <token>` | execute, refresh | Access token for execute; refresh token for refresh. The scheme name is case-sensitive |
+| `Content-Type: application/json` | execute | The daemon does not require it |
+| `X-Client-Version` | execute, refresh | The client's version string; the daemon evaluates it on execute only |
+| `User-Agent: op-forward/<version>` | execute | Informational; the daemon does not read it |
 
-Returned by the daemon when relevant:
+Response headers set by the daemon:
 
-| Header                | Value             | Sent on |
-|-----------------------|-------------------|---------|
-| `Content-Type`        | `application/json` | All JSON responses (success and error). |
-| `X-Update-Available`  | server version    | `/op/execute` whenever the client is older than the server. The client's version is *not* below `MinClientVersion`; this is a soft notice. |
+| Header | Meaning |
+|---|---|
+| `Content-Type: application/json` | Set on JSON responses. Plain-text error replies from `http.Error` use the standard library's text content type |
+| `X-Update-Available: <version>` | Set on execute responses when the client's version is older than the daemon's; the value is the daemon's version |
 
-The proxy treats `X-Update-Available` as advisory and prints
-`op-forward: update available …` to stderr. It does not block.
+## Health endpoint
 
----
-
-## `GET /health`
-
-Liveness check. No authentication, no peer-UID check, no body.
-
-Request:
-
-```http
-GET /health HTTP/1.1
-Host: unix
+```
+GET /health
 ```
 
-Response:
+Response, `200 OK`:
 
-```http
-HTTP/1.1 200 OK
-Content-Type: application/json
-
+```json
 {"status":"ok"}
 ```
 
-Use this when scripting tunnel verification — for example, after starting an
-SSH `RemoteForward` you can curl the socket:
+No token is required and the HTTP method is not checked. The proxy does not call
+it; `op-forward update` polls it after restarting the daemon, and it is the
+simplest manual probe:
 
 ```bash
-curl --unix-socket "$OP_FORWARD_SOCKET_PATH" http://unix/health
+curl -s --unix-socket "$HOME/Library/Caches/op-forward/op-forward.sock" http://unix/health
+curl -s http://127.0.0.1:18340/health   # when the daemon listens on TCP
 ```
 
----
+## Execute endpoint
 
-## `POST /op/execute`
-
-Run an `op` command on the host and stream the result back as a single JSON
-blob.
-
-### Request
-
-```http
-POST /op/execute HTTP/1.1
-Host: unix
-Authorization: Bearer <access-token>
-Content-Type: application/json
-X-Client-Version: 0.3.0
-
-{"args":["item","get","abc123","--fields","username"],"timeout_ms":60000}
+```
+POST /op/execute
 ```
 
-Body schema (`executor.Request`):
+### Execute request
 
-```jsonc
+```json
 {
-  "args":      ["item", "get", "abc123"],   // required, non-empty, length ≤ 64
-  "timeout_ms": 60000                        // optional; clamped to executor.MaxTimeout (5 min)
+  "args": ["item", "get", "<uuid>", "--fields", "username"],
+  "timeout_ms": 60000
 }
 ```
 
-Validation, performed in this order:
-
-1. Body size ≤ 1 MiB (enforced by `http.MaxBytesReader`); over → `400`.
-2. JSON well-formed; if not → `400`.
-3. `args` non-empty; ≤ 64 entries; each entry ≤ 4096 bytes; no `\``, `$`, `|`,
-   `;`, `&`, `\n`, `\r` characters; if any fail → `200` with
-   `exit_code = 1`, `stderr` describing the violation.
-4. `args[0]` not in the blocked set (`signin`, `signout`, `update`,
-   `completion`); if blocked → same `200` + `exit_code = 1` shape.
-
-### Successful response
-
-```http
-HTTP/1.1 200 OK
-Content-Type: application/json
-X-Update-Available: 0.4.0      ; only when client < server
-
-{"stdout":"alice\n","stderr":"","exit_code":0}
-```
-
-Body schema (`executor.Result`):
-
-```jsonc
-{
-  "stdout":    "...",   // captured combined PTY output (op's stdout + stderr)
-  "stderr":    "",      // empty on successful exec; populated on validation errors / timeouts
-  "exit_code": 0        // op's exit code, 1 on validation rejection, 124 on timeout
-}
-```
-
-**About `stderr`.** The daemon allocates a single PTY for the spawned `op`,
-which merges what `op` writes to fd 1 and fd 2 into one stream. That stream
-is returned in `stdout`. The `stderr` field is empty on a successful spawn
-and is only used to surface daemon-level failures that do not correspond to
-an HTTP error: validation rejections (blocked subcommand, shell metacharacter,
-oversize argument) and execution timeouts. The proxy prints `stdout` to its
-own stdout and `stderr` to its own stderr.
-
-**About `exit_code`.** Three cases:
-
-| Outcome | `exit_code` | `stderr` |
+| Field | Type | Meaning |
 |---|---|---|
-| `op` ran and exited           | op's native exit code | empty |
-| Validation rejected the request | `1` | description of the violation |
-| Execution timed out (PTY-bound) | `124` (matches `coreutils timeout(1)`) | `command timed out` |
+| `args` | array of strings | Arguments passed to `op`, without the leading `op` |
+| `timeout_ms` | integer, optional | Execution timeout in milliseconds; see [Timeouts](#timeouts) |
 
-### Error responses
+Unknown fields are ignored. The request body is limited to 1 MiB; a larger body,
+an empty body, or malformed JSON returns 400. Trailing data after the JSON value
+is rejected.
 
-| Status | Body                          | Cause |
-|--------|-------------------------------|-------|
-| `400 Bad Request` | `invalid request: ...` | Malformed JSON or oversized body. |
-| `401 Unauthorized` | `unauthorized` | Missing/invalid/expired access token. The proxy attempts `/token/refresh` automatically. |
-| `403 Forbidden` | `forbidden` | Peer UID does not match the daemon's UID. See [`security.md` § Peer-credential check](security.md#2-peer-credential-check). |
-| `405 Method Not Allowed` | `method not allowed` | Non-`POST`. |
-| `426 Upgrade Required` | `{"error":"client version <c> is below minimum required version <m> — please update with: op-forward update"}` | `X-Client-Version` < `MinClientVersion`. The proxy prints the message and exits `127`. |
-| `500 Internal Server Error` | `execution error: ...` | The daemon failed to spawn `op` (PATH lookup failure, exec error, etc.). |
+The daemon applies these steps in order and stops at the first that fails:
 
-The proxy treats every non-`200`, non-`401`, non-`426` as a generic infra
-failure and exits `127` with a stderr message including the status code.
+1. Peer-uid check (Unix connections only) -> `403`.
+2. Method must be `POST` -> `405`.
+3. Bearer value must equal the current access token and the token must be
+   unexpired -> `401`.
+4. If `X-Client-Version` is present, the version check -> `426` when the client
+   is below the minimum. See [Version negotiation](#version-negotiation).
+5. Parse the body -> `400`.
+6. Log the command (with redaction; see
+   [security.md](security.md#7-audit-logging-and-redaction)).
+7. Validate the arguments and run `op` ([security.md](security.md#5-argument-validation)).
+   An executor failure -> `500`.
 
----
+### Execute response
 
-## `POST /token/refresh`
+On any request that reaches the executor and completes, the status is `200 OK`
+with:
 
-Mint a new access token and rotate the refresh token. Authenticated with the
-*refresh* token (not the access token).
-
-### Request
-
-```http
-POST /token/refresh HTTP/1.1
-Host: unix
-Authorization: Bearer <refresh-token>
-X-Client-Version: 0.3.0
+```json
+{"stdout":"...","stderr":"","exit_code":0}
 ```
 
-No body. The handler ignores any body.
+| Field | Meaning |
+|---|---|
+| `stdout` | Everything `op` wrote; see [Output formatting](#output-formatting) |
+| `stderr` | Empty for output produced by `op`; carries a message when the daemon itself rejects the request or the command times out |
+| `exit_code` | `op`'s exit status, or one of the daemon-generated values in [Exit codes](#exit-codes) |
 
-### Successful response
+A request that fails argument validation is still a `200` response, with
+`exit_code` 1 and the reason in `stderr`. The messages are:
 
-```http
-HTTP/1.1 200 OK
-Content-Type: application/json
+| Condition | `stderr` |
+|---|---|
+| No arguments | `no arguments provided` |
+| More than 64 arguments | `too many arguments: N (max 64)` |
+| First argument is a blocked subcommand | `subcommand "signin" is not allowed through the proxy` |
+| An argument longer than 4096 bytes | `argument too long: N bytes (max 4096)` |
+| An argument contains one of the characters in the list in [security.md](security.md#5-argument-validation) | `argument contains disallowed character: "$"` |
 
-{
-  "access_token":    "abc...64hex",
-  "access_expires":  "2026-05-05T19:34:56+09:00",
-  "refresh_token":   "def...64hex",
-  "refresh_expires": "2026-06-04T18:34:56+09:00"
-}
-```
-
-Both expiries are RFC3339. The previous refresh token's value is invalid
-from this point forward. The new access token is also written to
-`session.token` on the host for backward compatibility — see
-[`tokens.md` § Daemon startup](tokens.md#daemon-startup).
-
-### Error responses
+### Execute errors
 
 | Status | Body | Cause |
 |---|---|---|
-| `401 Unauthorized` | `{"error":"refresh_token_expired","message":"…"}` | The Bearer token did not match the refresh token, or the refresh token is past its 30-day expiry. |
-| `401 Unauthorized` | `unauthorized` (text) | No `Authorization` header at all. |
-| `405 Method Not Allowed` | `method not allowed` | Non-`POST`. |
-| `500 Internal Server Error` | `internal error` | Random number generation for the new token pair failed. Extremely unlikely. |
+| 400 | `invalid request: <detail>` | Body missing, malformed, or over 1 MiB |
+| 401 | `unauthorized` | Missing, malformed, wrong, or expired access token |
+| 403 | `forbidden` | Unix peer uid differs from the daemon's uid |
+| 405 | `method not allowed` | Method other than `POST`; checked before authentication |
+| 426 | `{"error":"client version X is below minimum required version Y — please update with: op-forward update"}` | Client older than `MinClientVersion` |
+| 500 | `execution error: <detail>` | The executor could not run `op`, for example `op CLI not found in PATH` or a failure to allocate the pseudo-terminal |
 
-The descriptive `refresh_token_expired` message is verbose on purpose: the
-expected reader is a confused user trying to figure out why their VM cannot
-talk to 1Password. The text states explicitly that the issue is *not* a
-1Password authentication problem and points at the redeploy fix.
+The 426 body is JSON; the others are plain text produced by `http.Error`.
 
----
+## Refresh endpoint
 
-## Version negotiation
+```
+POST /token/refresh
+Authorization: Bearer <refresh token>
+```
 
-The daemon evaluates `X-Client-Version` against two boundaries on every
-`/op/execute`:
+There is no request body.
 
-1. **`MinClientVersion`** (default `0.1.0`, defined in
-   [`internal/daemon/server.go`](../internal/daemon/server.go)): hard floor.
-   Clients below this version receive `426 Upgrade Required`.
-2. **Server version** (the daemon's own `cmd.Version`, threaded through
-   `daemon.New`): soft notice. Clients below this version receive
-   `X-Update-Available: <server version>`.
+### Refresh response
 
-Special cases:
+`200 OK`:
 
-- Empty `X-Client-Version` (header not sent) → no upgrade enforcement, no
-  notice. This is the backward-compat path for callers that pre-date version
-  negotiation.
-- `X-Client-Version: dev` → same as empty. Local dev builds are never
-  rejected.
+```json
+{
+  "access_token": "<64 hex characters>",
+  "access_expires": "2026-10-16T15:30:00Z",
+  "refresh_token": "<64 hex characters>",
+  "refresh_expires": "2026-11-15T14:30:00Z"
+}
+```
 
-Comparison is strict semver-like (`major.minor.patch`, integers only).
-A leading `v` is stripped. Non-numeric components reduce to `0.0.0`. Source:
-[`internal/version/compare.go`](../internal/version/compare.go).
+All four fields are always present, and expiry values are RFC 3339. The
+previous access and refresh tokens are invalid as soon as the response is
+produced. Lifetimes and rotation semantics are in [tokens.md](tokens.md#refresh-endpoint-behavior).
 
-The notice and the hard block are independent — a client below
-`MinClientVersion` gets `426` regardless of `X-Update-Available`. The
-matching test cases live in
-[`internal/daemon/server_test.go`](../internal/daemon/server_test.go) under
-`TestExecute_VersionNegotiation_*` and
-[`internal/version/compare_test.go`](../internal/version/compare_test.go).
+### Refresh errors
 
-When to bump `MinClientVersion`:
+| Status | Body | Cause |
+|---|---|---|
+| 401 | `unauthorized` (plain text) | No `Authorization: Bearer` header |
+| 401 | JSON with `error` set to `refresh_token_expired` and a human-readable `message` | The bearer value does not match the daemon's current refresh token, or that token has expired |
+| 403 | `forbidden` | Unix peer uid differs from the daemon's uid |
+| 405 | `method not allowed` | Method other than `POST` |
+| 500 | `internal error` | Token generation failed |
 
-- The previous release had a client-side validation bug that the daemon
-  cannot retroactively close.
-- The wire protocol changed in a way that an older client would
-  *silently* misuse (a structurally incompatible change normally produces
-  `400`s, which are loud — that does not need a bump).
+`X-Client-Version` is sent on refresh requests but not evaluated, so an
+out-of-date client can still refresh.
 
----
+## Status codes
+
+| Code | Produced by | Meaning |
+|---|---|---|
+| 200 | all endpoints | Success, including validation failures on execute (see above) |
+| 400 | execute | Unreadable request body |
+| 401 | execute, refresh | Authentication failed |
+| 403 | all routes | Peer uid mismatch (Unix transport only) |
+| 404 | unknown path | No such route |
+| 405 | execute, refresh | Wrong HTTP method |
+| 426 | execute | Client below the minimum version |
+| 500 | execute, refresh | Server-side failure |
+
+The proxy treats every status other than 200 on execute as an infrastructure
+failure: it prints `daemon returned HTTP N` and the body to stderr and exits 127
+(426 prints only the body). A 401 on execute is handled first by a refresh and
+one retry.
+
+## Exit codes
+
+The exit status a caller of the shim observes is determined as follows:
+
+| Status | Source | Meaning |
+|---|---|---|
+| 0 and other values relayed from `op` | `exit_code` in the response | The status `op` returned on the host |
+| 1 | `exit_code` in the response | The daemon rejected the request during argument validation; the reason is on stderr |
+| 124 | `exit_code` in the response | The command exceeded its host-side timeout |
+| 127 | the proxy | Infrastructure failure; the shim reacts by running the real `op` |
+| 1 | the shim | Proxy returned 127 and no fallback `op` binary is recorded or executable; prints `op-forward: proxy unavailable and no fallback op binary` |
+| 2 | the proxy | Command-line flag error (the proxy's flag parser exits with 2) |
+
+The proxy returns 127 for: an unparsable endpoint, no token files, a daemon that
+does not accept a connection within the probe timeout, a transport error during
+the request, a failed refresh, a 426, any other non-200 status, and an
+unparsable response body.
+
+Two consequences follow from using 127 as the signal:
+
+- The shim runs the real `op` after a 127 whatever the reason, including 403,
+  426, and refresh failures. On a machine without a usable local `op`, the user
+  sees the proxy's message on stderr followed by the shim's fallback error.
+- If `op` itself exits with 127 on the host, the value is relayed unchanged and
+  the shim cannot distinguish it from an infrastructure failure.
+
+The shim logic is in the template in [cmd/install.go](../cmd/install.go).
+
+## Output formatting
+
+The executor starts `op` under a pseudo-terminal, so `op` sees a terminal on
+standard input, output, and error. Three consequences:
+
+- **Streams are merged.** A terminal has one output channel, so everything `op`
+  writes arrives in `stdout`. `stderr` in the response is empty for output
+  produced by `op`.
+- **Terminal-style output passes through unchanged.** Because `op` believes it
+  is attached to an interactive terminal, it may format output for a terminal,
+  including ANSI color escape sequences. The daemon and the proxy do not strip or
+  rewrite them; the escape sequences reach the client as part of `stdout`. A
+  caller that needs plain text must remove escapes itself.
+- **Output is carried as a JSON string.** `stdout` is a JSON string, so output
+  must be valid UTF-8 to arrive intact. Invalid UTF-8 sequences are replaced
+  during JSON encoding, which means binary output is not preserved exactly.
+- **Newlines are not translated, in practice.** The executor turns off the
+  terminal's output post-processing (OPOST) immediately after starting `op`, so
+  `\n` is normally not converted to `\r\n`. The change is applied after the
+  process has started and the result of the terminal calls is not checked, so
+  there is a narrow window in which very early output could still be translated,
+  and no translation is guaranteed if those calls fail.
+
+Standard input is not forwarded. The request carries arguments only, so
+subcommands that read from stdin do not receive the caller's input.
 
 ## Timeouts
 
-Three layers of timeout cooperate. From innermost to outermost:
-
-| Layer | Default | Source |
+| Setting | Default | Where |
 |---|---|---|
-| Proxy probe (Unix dial) | 500 ms | `OP_FORWARD_PROBE_TIMEOUT_MS` |
-| Proxy HTTP request total | 60000 ms + 5 s slack | `OP_FORWARD_FETCH_TIMEOUT_MS` |
-| Server read timeout | 30 s | `http.Server.ReadTimeout` |
-| Server write timeout | `MaxTimeout + 10s` (5 m 10 s) | `http.Server.WriteTimeout` |
-| Per-`op` execution | `timeout_ms` from request when `> 0` (capped at 5 m), otherwise `DefaultTimeout` (60 s) | `executor.Execute` |
+| Execution timeout | 60 s when `timeout_ms` is absent or not positive | `executor.DefaultTimeout` |
+| Maximum execution timeout | 300 s; larger requests are reduced to this | `executor.MaxTimeout` |
+| Proxy `--timeout` / `OP_FORWARD_FETCH_TIMEOUT_MS` | 60000 ms | Sent as `timeout_ms` |
+| Proxy HTTP client timeout | `timeout_ms` + 5 s | Gives the host time to answer after its own timeout fires |
+| Probe timeout (`OP_FORWARD_PROBE_TIMEOUT_MS`) | 500 ms | Connection attempt before the request |
+| Server read timeout | 30 s | Headers and body |
+| Server write timeout | 310 s | Maximum execution timeout plus 10 s |
+| Server idle timeout | 120 s | Keep-alive connections |
 
-If `op` exceeds its execution timeout, the daemon kills it via context
-cancellation and returns `200` with `exit_code = 124`. Clients should treat
-124 as "command timed out" — same convention as `coreutils timeout(1)`.
+The execution clock starts before `op` runs and includes the time the user
+takes to answer the biometric prompt. When the clock expires, the daemon
+terminates `op` and returns `exit_code` 124. This is the contract; it matches
+the convention of `timeout(1)`.
 
----
+## Version negotiation
 
-## Sequence diagrams
+The proxy sends its version in `X-Client-Version`. If the header is present, the
+daemon (on `/op/execute` only, after authentication) evaluates it with
+`version.CheckCompatibility`
+([internal/version/compare.go](../internal/version/compare.go)):
 
-### Successful execute, valid access token
+| Client version | Result |
+|---|---|
+| Empty, or `dev` | No check; the request proceeds |
+| Below `MinClientVersion` | `426 Upgrade Required` with `X-Update-Available` set to the daemon's version |
+| At or above the minimum but below the daemon's version | Request proceeds; response carries `X-Update-Available` |
+| Equal to or above the daemon's version | Request proceeds; no header |
 
-```
-proxy                                    daemon
-  |                                        |
-  |-- TCP-ish dial via Unix socket ------->|
-  |<-- (open) ---------------------------- |
-  |                                        |
-  |-- POST /op/execute ------------------->|
-  |   Authorization: Bearer <access>       |
-  |   X-Client-Version: 0.3.0              |
-  |   {"args":[...]}                       |
-  |                                        | peer-UID OK
-  |                                        | bearer matches access token
-  |                                        | spawn op under PTY
-  |                                        | wait for op to finish
-  |<------------------ 200 OK --------------|
-  |   {"stdout":..., "stderr":"", "exit_code":0}
-  |                                        |
-print stdout, exit(0)
-```
+If the header is absent, the check is skipped entirely and no
+`X-Update-Available` is sent.
 
-### Self-healing refresh after access-token expiry
+`MinClientVersion` is a package variable in the daemon, currently `0.1.0`
+([internal/daemon/server.go](../internal/daemon/server.go)). Raising it means
+changing that value and releasing a new daemon; nothing reads it from the
+environment or a flag.
 
-```
-proxy                                    daemon
-  |-- POST /op/execute  (Bearer access) -->|
-  |<------------------ 401 Unauthorized ---|
-  |                                        |
-  |-- POST /token/refresh (Bearer refresh)>|
-  |                                        | mint access' + refresh'
-  |                                        | rotate in-memory state
-  |                                        | persist both files
-  |<--- 200 + {access',refresh',expires} --|
-  | save access.token and refresh.token    |
-  |                                        |
-  |-- POST /op/execute (Bearer access') -->|
-  |<------------------ 200 OK --------------|
-print stdout, exit(0)
-```
+Versions are compared as `major.minor.patch`. A leading `v` is ignored. Missing
+components count as 0. A component that is not a plain integer, including a
+pre-release suffix such as `1.2.3-rc1`, makes the whole version compare as
+`0.0.0`. A daemon built without a version (`dev`) compares as `0.0.0`, so it
+does not report an update to a client that is at or above the minimum version.
+The one exception is the `426` response: when a client below the minimum
+triggers it, the daemon sets `X-Update-Available` to its own version even if
+that version is `dev`.
 
-### Expired refresh
+The proxy prints a hint on stderr whenever the header is present, even if the
+request otherwise succeeds:
 
 ```
-proxy                                    daemon
-  |-- POST /op/execute (Bearer access) --->|
-  |<------------------ 401 Unauthorized ---|
-  |-- POST /token/refresh (Bearer refresh)>|
-  |<-- 401 {error:"refresh_token_expired"} |
-print actionable message, exit 127
+op-forward: update available (v0.7.2 → v0.7.3) — run: op-forward update
 ```
 
-Exit `127` is the bash shim's fallback signal — it then `exec`s the real
-`op` binary (the one the shim resolved at install time). On a VM with a
-locally installed `op`, that fallback runs and may surface a different,
-less actionable error from `op` itself. If the actionable redeploy message
-is what you want users to see, ensure the VM does not have a usable real
-`op` binary on `PATH` outside `~/.local/bin`. See
-[`cli.md` § install](cli.md#install) for the shim's resolution logic.
+On a 426 it prints the response body and exits 127. The text goes to stderr, so
+`op` output on stdout is unaffected.
 
----
+## Sequences
+
+Successful execute:
+
+```
+proxy                               daemon
+  | POST /op/execute (access token)   |
+  |---------------------------------->| peer check, bearer check, version check
+  |                                   | validate, run op under a PTY
+  |<----------------------------------| 200 {"stdout","stderr","exit_code"}
+```
+
+Access token expired or daemon restarted:
+
+```
+proxy                               daemon
+  | POST /op/execute                  |
+  |---------------------------------->|
+  |<----------------------------------| 401
+  | POST /token/refresh (refresh)     |
+  |---------------------------------->| rotate both tokens, persist
+  |<----------------------------------| 200 {new pair}
+  | save files; POST /op/execute      |
+  |---------------------------------->|
+  |<----------------------------------| 200
+```
+
+Refresh rejected:
+
+```
+proxy                               daemon
+  | POST /token/refresh               |
+  |---------------------------------->|
+  |<----------------------------------| 401 {"error":"refresh_token_expired",...}
+  | prints "token refresh failed", exit 127
+  | shim runs the real op
+```
 
 ## See also
 
-- [`transport.md`](transport.md) — what HTTP runs on top of
-- [`tokens.md`](tokens.md) — Bearer token semantics
-- [`security.md`](security.md) — argument validation, blocked subcommands,
-  redaction
-- [`cli.md`](cli.md) — how the proxy and daemon are invoked
-- [`internal/daemon/server.go`](../internal/daemon/server.go) — handler implementations
-- [`internal/executor/op.go`](../internal/executor/op.go) — request validation and PTY execution
+- [tokens.md](tokens.md) for token lifetimes and the refresh flow
+- [security.md](security.md) for validation, logging, and limits
+- [transport.md](transport.md) for the connection layer
+- [cli.md](cli.md#proxy) for the proxy command's flags

@@ -1,248 +1,239 @@
-# CLI reference
+# Command-line reference
 
-The op-forward binary is a single executable with several subcommands.
-Routing happens in [`cmd/root.go`](../cmd/root.go); each subcommand lives in
-its own file.
+`op-forward` is a single binary with subcommands. Dispatch happens in the
+`switch` in [cmd/root.go](../cmd/root.go); each subcommand is implemented in its
+own file under [cmd/](../cmd). Environment variables and precedence are in
+[configuration.md](configuration.md).
 
-## Top-level form
-
-```
-op-forward <subcommand> [args...]
-```
-
-Aliases for help: `op-forward help`, `op-forward --help`, `op-forward -h`.
-With no subcommand, the binary prints usage and exits `0`.
-
-A subcommand the binary does not recognise prints usage and exits `1`.
-
-## Exit codes
-
-Two distinct meanings, depending on which subcommand:
-
-- For `op-forward proxy`: `127` is the **infrastructure failure** sentinel.
-  It signals "tunnel down, no token, daemon unreachable, refresh failed".
-  The bash shim from `op-forward install` checks this code to decide whether
-  to fall back to a real `op` binary. Any other exit code (including `0`) is
-  treated as op's own exit code and used as-is.
-- For every other subcommand: a non-zero exit code is a normal Go error.
-
-## `serve`
-
-Start the host daemon. Long-running.
+## Synopsis
 
 ```
-op-forward serve
+op-forward serve [--listen EP] [--port N]
+op-forward install [--port N]
+op-forward proxy [--addr EP] [--host H] [--port N] [--timeout MS] [--] [op arguments...]
+op-forward service install
+op-forward service uninstall
+op-forward update
+op-forward version
+op-forward help | --help | -h
 ```
 
-Behaviour:
+Subcommands recognized by the dispatcher: `serve`, `install`, `proxy`,
+`service`, `update`, `version`, and `help` (also `--help` and `-h`).
 
-1. Migrate `session.token` → `refresh.token` if needed (see
-   [`tokens.md` § Daemon startup](tokens.md#daemon-startup)).
-2. Load or generate the refresh token.
-3. Always generate a fresh access token; write it to `access.token` and to
-   `session.token` (for older clients).
-4. Resolve the socket path, `MkdirAll` its parent at `0700`, remove any
-   stale inode, `Listen("unix", …)`, `Chmod(0600)`.
-5. Register `/health`, `/op/execute`, `/token/refresh`.
-6. Block in `Server.Serve(ln)`. The process exits when `Serve` returns
-   (typically only on `SIGTERM` from `op-forward update`).
+Behavior of the dispatcher:
 
-The daemon prints token paths and the socket URL to stdout on startup, so
-the launchd log file becomes the deployment record.
+- With no arguments it prints the usage text and exits 0.
+- `help`, `--help`, and `-h` print the usage text and exit 0.
+- An unknown subcommand prints `Unknown command: NAME` to stderr, then the usage
+  text, and exits 1.
+- The subcommands that take flags use Go's `flag` package with
+  exit-on-error behavior: a flag error prints a message and usage and exits 2,
+  and `-h` after a subcommand prints that subcommand's flags and exits 0.
 
-No flags. Configuration is via environment variables — see
-[`configuration.md`](configuration.md).
-
-## `install`
-
-Install the `op` shim on the remote side (VM).
+## serve
 
 ```
-op-forward install
+op-forward serve [--listen EP] [--port N]
 ```
 
-Behaviour:
+Starts the host daemon in the foreground. It does not detach; for a persistent
+daemon use [`service install`](#service) on macOS.
 
-- Resolves the **real** `op` binary by walking `$PATH` and skipping
-  `~/.local/bin` (so it does not pick up the shim it is about to write).
-  Falls back to `/usr/bin/op` if no real `op` is found anywhere on PATH.
-- Resolves the running `op-forward` binary's path (preferring `op-forward`
-  in the same directory as the planned shim, then `os.Executable()`).
-- Writes `~/.local/bin/op` (mode `0755`) with both paths embedded.
-- Verifies that `which op` resolves to the new shim; warns otherwise.
+| Flag | Default | Meaning |
+|---|---|---|
+| `--listen EP` | `$OP_FORWARD_LISTEN` | `unix:///absolute/path.sock` or `tcp://127.0.0.1:PORT`. Overrides `--port` |
+| `--port N` | `$OP_FORWARD_PORT` or 18340 | Loopback TCP port. Typing it (or setting `OP_FORWARD_PORT`) selects TCP when no endpoint is given; otherwise the daemon binds the default Unix socket |
 
-The shim itself is short bash:
+Precedence between these and the environment is described in
+[configuration.md](configuration.md#precedence-rules).
 
-```bash
-#!/bin/bash
-REAL_OP="<real op path>"
-OP_FORWARD_BIN="<op-forward path>"
-
-if [ -x "$OP_FORWARD_BIN" ]; then
-  "$OP_FORWARD_BIN" proxy -- "$@"
-  EXIT=$?
-  if [ $EXIT -ne 127 ]; then
-    exit $EXIT
-  fi
-fi
-
-if [ -n "$REAL_OP" ] && [ -x "$REAL_OP" ]; then
-  exec "$REAL_OP" "$@"
-fi
-
-echo "op-forward: proxy unavailable and no fallback op binary" >&2
-exit 1
-```
-
-The fallback path is what makes the shim safe to install proactively: a VM
-without a tunnel still has a working `op` for local commands.
-
-No flags. The shim location is hardcoded; `PATH` ordering is the only knob.
-
-## `proxy`
-
-The per-invocation client. Normally invoked by the bash shim, but also a
-fully usable CLI for testing.
+On startup it migrates a legacy `session.token`, loads or generates the refresh
+token, generates and writes a fresh access token, and prints their locations:
 
 ```
-op-forward proxy [--timeout MILLISECONDS] -- <op-args...>
+Refresh token reused (expires 2026-11-15T14:30:00-07:00)
+Refresh token at: /Users/me/Library/Caches/op-forward/refresh.token
+Access token written to: /Users/me/Library/Caches/op-forward/access.token (expires 2026-10-16T15:30:00-07:00)
+Starting daemon on unix:///Users/me/Library/Caches/op-forward/op-forward.sock
+op-forward daemon listening on unix:///Users/me/Library/Caches/op-forward/op-forward.sock
 ```
 
-Flags:
+The first line reads `Refresh token generated (no valid existing token found)`
+when a new refresh token was created. The details are in
+[tokens.md](tokens.md#daemon-startup). The command runs until the listener fails
+and then returns the error. A TCP bind to a non-loopback address, a Unix socket
+in a shared directory, an existing non-socket file, or a socket that is already
+in use stops it before it serves (see [transport.md](transport.md)).
 
-| Flag        | Default                              | Effect |
-|-------------|--------------------------------------|--------|
-| `--timeout` | `OP_FORWARD_FETCH_TIMEOUT_MS` or `60000` | Per-request budget in milliseconds. Forwarded to the daemon as `timeout_ms` and clamped server-side to 5 minutes. |
+## install
 
-The `--` separator is not required by Go's `flag` package, but the shim
-always passes it so subsequent `op` flags (which start with `--`) do not get
-interpreted as proxy flags. Pass it yourself when invoking by hand.
-
-Examples:
-
-```bash
-op-forward proxy -- account list
-op-forward proxy --timeout 5000 -- item get my-item --fields username
+```
+op-forward install [--port N]
 ```
 
-Behaviour summary (full description in
-[`tokens.md` § Proxy request flow](tokens.md#proxy-request-flow)):
+Writes the `op` shim on the machine where it runs, normally the remote side.
 
-1. Resolve socket path; probe with a Unix dial.
-2. Read access token and on-disk expiry.
-3. POST `/op/execute` with the access token.
-4. On `401`, POST `/token/refresh` with the refresh token; on success retry
-   `/op/execute` once with the new access token.
-5. Relay the JSON response: print `stdout`, print `stderr`, exit with
-   `exit_code`.
+| Flag | Meaning |
+|---|---|
+| `--port N` | Accepted for compatibility with older scripts and ignored. The shim reads `OP_FORWARD_ADDR`, `OP_FORWARD_HOST`, and `OP_FORWARD_PORT` every time it runs, so nothing is stored at install time |
 
-Notable status handling:
+Steps:
 
-- `426 Upgrade Required` → print the daemon's message, exit `127`.
-- `X-Update-Available` header → emit `op-forward: update available …` to
-  stderr and proceed normally.
+1. Find the real `op`: the first file named `op` on `PATH`, skipping
+   `~/.local/bin`; `/usr/bin/op` if none is found. The path is recorded in the
+   shim as the fallback.
+2. Choose the `op-forward` path to record: `~/.local/bin/op-forward` if that
+   file exists, otherwise the path of the running executable.
+3. Create `~/.local/bin` (mode 0755) and write `~/.local/bin/op` with mode 0755,
+   replacing any existing file there.
+4. Print the shim path, the real `op` path, and whether `op` on `PATH` now
+   resolves to the shim. If it does not, `~/.local/bin` is not first on `PATH`.
 
-## `service install` / `service uninstall`
+The shim is a Bash script (`#!/bin/bash`), so `/bin/bash` must exist on the
+machine. If the recorded `op-forward` path is no longer executable (for example
+after a package moved the binary) it uses `op-forward` from `PATH`. It then runs
+`op-forward proxy -- "$@"`; if the exit status is anything other than 127 it
+exits with that status. If `op-forward` cannot be found or the proxy exits 127,
+the shim runs the recorded real `op`. If that is not executable either, it prints
+`op-forward: proxy unavailable and no fallback op binary` and exits 1.
+The template is `shimTemplate` in [cmd/install.go](../cmd/install.go).
 
-Manage the launchd LaunchAgent for the daemon. macOS only — running on
-another OS errors with `service management is only supported on macOS`.
+Re-run `install` after changing which `op` is the real one or after installing
+`op-forward` to a different location.
+
+## proxy
+
+```
+op-forward proxy [--addr EP] [--host H] [--port N] [--timeout MS] [--] [op arguments...]
+```
+
+Forwards one `op` invocation to the daemon and reproduces its output and exit
+status. The shim calls it; calling it directly is useful for diagnosis.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--addr EP` | `$OP_FORWARD_ADDR` | Daemon endpoint (`unix:///path.sock` or `tcp://host:port`). Overrides `--host` and `--port`. With none of these set, the proxy dials the default Unix socket |
+| `--host H` | `$OP_FORWARD_HOST` or `127.0.0.1` | Daemon TCP host; typing or setting it selects TCP. Use `host.docker.internal` for Docker Desktop containers |
+| `--port N` | `$OP_FORWARD_PORT` or 18340 | Daemon TCP port; typing or setting it selects TCP |
+| `--timeout MS` | `$OP_FORWARD_FETCH_TIMEOUT_MS` or 60000 | Execution timeout sent to the daemon (the daemon caps it at 300000) |
+
+Put `--` before the `op` arguments so that flags such as `--fields` are not
+interpreted as proxy flags. The shim always does this.
+
+Exit status:
+
+| Status | Meaning |
+|---|---|
+| `op`'s own status | The command ran on the host; stdout and stderr were reproduced locally |
+| 1 | The daemon rejected the arguments (for example a blocked subcommand, or no arguments) |
+| 124 | The command timed out on the host |
+| 127 | Infrastructure failure: bad endpoint, no tokens, daemon unreachable, failed refresh, upgrade required, or any non-200 reply |
+| 2 | Invalid proxy flag |
+
+The conditions behind 127 and the output rules are in
+[protocol.md](protocol.md#exit-codes). Diagnostics, including
+`update available (...)` hints, are written to stderr so they never mix with
+`op` output on stdout.
+
+## service
 
 ```
 op-forward service install
 op-forward service uninstall
 ```
 
-`service install`:
+Manages a launchd LaunchAgent for the daemon. Available on macOS only; elsewhere
+the command fails with `service management is only supported on macOS`. With no
+second word it prints `Usage: op-forward service [install|uninstall]`; any other
+word is an error (`unknown service command: NAME`). No flags are accepted.
 
-- Creates `~/Library/LaunchAgents/com.op-forward.daemon.plist` with the
-  current binary path, the user's home, a static PATH covering both Apple
-  Silicon and Intel Homebrew, log files at `~/Library/Logs/op-forward.log`,
-  and `RunAtLoad` + `KeepAlive` set to `true`.
-- Tries `launchctl unload && launchctl load -w`. If that fails (newer
-  macOS), falls back to `launchctl bootout gui/<uid>` then `launchctl
-  bootstrap gui/<uid>`.
+### service install
 
-`service uninstall`:
+1. Resolve the path of the running binary, following symlinks.
+2. Resolve the listen endpoint now, from `OP_FORWARD_LISTEN`,
+   `OP_FORWARD_PORT`, or `OP_FORWARD_SOCKET_PATH` in the current environment
+   (default: the Unix socket `~/Library/Caches/op-forward/op-forward.sock`).
+   launchd does not inherit the shell environment, so the endpoint is written
+   into the plist.
+3. Write `~/Library/LaunchAgents/com.op-forward.daemon.plist`. Its program
+   arguments are `<binary> serve --listen <endpoint>`; its environment sets
+   `PATH` to `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
+   and `HOME`; it sets `RunAtLoad` and `KeepAlive`; it sends stdout and stderr
+   to `~/Library/Logs/op-forward.log`. Values are XML-escaped.
+4. Unload any existing job, then `launchctl load -w`. If that fails it tries
+   `launchctl bootout` followed by `launchctl bootstrap gui/<uid>`.
+5. Print the plist and log paths.
 
-- Runs `launchctl unload` (best-effort).
-- Removes the plist file.
+Run `service install` again after moving the binary, or after changing the
+endpoint, because the plist records both.
 
-Either command is idempotent.
+### service uninstall
 
-The launchd label is `com.op-forward.daemon`. To kickstart manually:
+Unloads the job (ignoring errors), removes the plist if it exists, and prints
+`Launchd service uninstalled.` Token files and logs are left in place.
 
-```bash
-launchctl kickstart -k gui/$(id -u)/com.op-forward.daemon
-```
-
-## `update`
-
-Self-update the binary from the latest GitHub release.
+## update
 
 ```
 op-forward update
 ```
 
-Behaviour:
+Replaces the running binary with the latest GitHub release.
 
-1. `GET https://api.github.com/repos/reishoku/fork.op-forward/releases/latest`.
-2. Compare the returned `tag_name` (with the leading `v` stripped) against
-   `cmd.Version`. If equal → "Already up to date", exit `0`.
-3. Find the asset named
-   `op-forward_<version>_<runtime.GOOS>_<runtime.GOARCH>.tar.gz`. If none
-   matches, error with "no release binary found for `<os>/<arch>`".
-4. Download the tarball; extract the `op-forward` entry into memory.
-5. Write the binary contents to `<exec>.update` and `os.Rename` over the
-   live executable. `EvalSymlinks` is used so a Homebrew install sees the
-   real path, not the bin shim.
-6. `pgrep -f "<binPath> serve"` to find the running daemon. If found,
-   `SIGTERM` it. launchd respawns it with the new binary.
+1. Print the current version and query
+   `https://api.github.com/repos/reishoku/fork.op-forward/releases/latest`.
+2. If the tag without its leading `v` equals the current version string, print
+   `Already up to date` and stop. A build whose version is `dev` therefore always
+   proceeds.
+3. Download `op-forward_<version>_<os>_<arch>.tar.gz` for the running platform
+   and extract the entry named `op-forward`. No checksum or signature is
+   verified.
+4. Write the new binary next to the current one (`<path>.update`, mode 0755) and
+   rename it over the current path, which is resolved through symlinks. The
+   user needs write access to that directory.
+5. Look for a running daemon with `pgrep -f "<binary path> serve"`. If one is
+   found, send it SIGTERM and print its PID. If none is found, print that it will
+   pick up the new version on its next start and finish.
+6. If the daemon was signaled, wait for it to return: poll `GET /health` on the
+   endpoint every 500 ms for up to 30 seconds (each attempt has a 2-second
+   timeout). On success print `Daemon is serving again on <endpoint>`. On timeout
+   return an error naming the endpoint, the last failure, and a hint to check
+   `~/Library/Logs/op-forward.log` or run `launchctl kickstart -k
+   gui/$(id -u)/com.op-forward.daemon`.
 
-Caveats:
+Points to know:
 
-- Running this on a Homebrew install desyncs the formula's metadata. Prefer
-  `brew upgrade reishoku/tap/op-forward`.
-- On the VM (Linux), prefer `apt-get upgrade op-forward` if you installed
-  via the APT repo.
-- `update` does not verify a signature or checksum; it trusts GitHub's
-  TLS connection. The release pipeline does sign the APT repo, so APT users
-  benefit from GPG verification automatically.
+- The endpoint polled in step 6 is resolved from `OP_FORWARD_LISTEN` and
+  `OP_FORWARD_PORT` in the environment of the `update` command. If the daemon
+  was installed with a different endpoint, set the same variables when running
+  `update`.
+- The daemon is expected to be restarted by a supervisor. launchd's `KeepAlive`
+  does so; a daemon started by hand with `serve` is stopped by the signal and not
+  restarted, in which case the wait reports a failure.
+- launchd throttles respawns, so the daemon is typically unreachable for a few
+  seconds. This is why the command waits instead of returning immediately.
+- Installations from a package manager or Homebrew should be updated with that
+  tool. The binary of a package lives in `/usr/bin`, which a normal user cannot
+  write.
 
-## `version`
-
-Print the version string the binary was built with.
+## version
 
 ```
 op-forward version
 ```
 
-Output:
+Prints `op-forward <version>`, where the version is stamped at build time or is
+`dev` for an unstamped build.
 
-```
-op-forward 0.3.0
-```
+## help
 
-The version comes from `cmd.Version`, set by the build via `-ldflags="-X
-github.com/reishoku/fork.op-forward/cmd.Version=<version>"`. Builds without
-that flag report `dev`.
-
-## `help`, `--help`, `-h`
-
-Print the usage message and exit `0`.
-
-```
-op-forward help
-op-forward --help
-op-forward -h
-```
-
-The usage message is generated by `cmd.printUsage` and includes a one-line
-architecture diagram. It is also printed when no subcommand is given.
+`op-forward help`, `--help`, and `-h` print the usage text, which lists the
+subcommands above and the one-line architecture summary.
 
 ## See also
 
-- [`architecture.md`](architecture.md) — how these subcommands fit together
-- [`protocol.md`](protocol.md) — what `proxy` and `serve` send each other
-- [`tokens.md`](tokens.md) — what `serve` writes and `proxy` reads
-- [`deployment.md`](deployment.md) — when to call which subcommand
-- [`configuration.md`](configuration.md) — every env var these subcommands consult
+- [configuration.md](configuration.md) for variables and precedence
+- [deployment.md](deployment.md) for end-to-end setup
+- [protocol.md](protocol.md) for what `proxy` sends and receives
+- [development.md](development.md) for how releases are produced

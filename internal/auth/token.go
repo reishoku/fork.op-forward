@@ -152,6 +152,8 @@ func SaveToPath(t *Token, path string) error {
 		return fmt.Errorf("writing token: %w", err)
 	}
 	if err := root.Rename(tmp, base); err != nil {
+		// Best-effort removal of the staged temp file; the rename failure
+		// returned below is the actionable error.
 		_ = root.Remove(tmp)
 		return fmt.Errorf("renaming token file: %w", err)
 	}

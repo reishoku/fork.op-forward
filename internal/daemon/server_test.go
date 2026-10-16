@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/reishoku/fork.op-forward/internal/auth"
+	"github.com/reishoku/fork.op-forward/internal/endpoint"
 	"github.com/reishoku/fork.op-forward/internal/executor"
 )
 
-func newTestServer(t *testing.T) (*Server, string, string) {
-	t.Helper()
+func newTestServer() (*Server, string, string) {
 	accessToken := &auth.Token{
 		Value:   "test-access-token-abc123",
 		Expires: time.Now().Add(1 * time.Hour),
@@ -28,7 +28,7 @@ func newTestServer(t *testing.T) (*Server, string, string) {
 	srv := &Server{
 		accessToken:  accessToken,
 		refreshToken: refreshToken,
-		socketPath:   filepath.Join(t.TempDir(), "op-forward-test.sock"),
+		endpoint:     endpoint.TCP("127.0.0.1", 18340),
 		version:      "0.3.0",
 	}
 	return srv, accessToken.Value, refreshToken.Value
@@ -42,11 +42,11 @@ func newTestServerWithTempToken(t *testing.T) (*Server, string, string) {
 	tmpDir := t.TempDir()
 	t.Setenv("OP_FORWARD_TOKEN_FILE", filepath.Join(tmpDir, "access.token"))
 	t.Setenv("OP_FORWARD_TOKEN_DIR", tmpDir)
-	return newTestServer(t)
+	return newTestServer()
 }
 
 func TestHealthEndpoint(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+	srv, _, _ := newTestServer()
 	req := httptest.NewRequest("GET", "/health", nil)
 	w := httptest.NewRecorder()
 
@@ -57,14 +57,16 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 
 	var body map[string]string
-	json.NewDecoder(w.Body).Decode(&body)
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding health response: %v", err)
+	}
 	if body["status"] != "ok" {
 		t.Errorf("health body status = %q, want 'ok'", body["status"])
 	}
 }
 
 func TestExecute_NoAuth(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+	srv, _, _ := newTestServer()
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("POST", "/op/execute", bytes.NewReader(body))
 	w := httptest.NewRecorder()
@@ -77,7 +79,7 @@ func TestExecute_NoAuth(t *testing.T) {
 }
 
 func TestExecute_WrongToken(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+	srv, _, _ := newTestServer()
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("POST", "/op/execute", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer wrong-token")
@@ -101,7 +103,7 @@ func TestExecute_ExpiredToken(t *testing.T) {
 		Expires: time.Now().Add(30 * 24 * time.Hour),
 		TTL:     auth.RefreshTokenTTL,
 	}
-	srv := &Server{accessToken: accessToken, refreshToken: refreshToken, socketPath: filepath.Join(t.TempDir(), "op-forward-test.sock"), version: "0.3.0"}
+	srv := &Server{accessToken: accessToken, refreshToken: refreshToken, endpoint: endpoint.TCP("127.0.0.1", 18340), version: "0.3.0"}
 
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("POST", "/op/execute", bytes.NewReader(body))
@@ -116,7 +118,7 @@ func TestExecute_ExpiredToken(t *testing.T) {
 }
 
 func TestExecute_RefreshTokenRejectedForExecute(t *testing.T) {
-	srv, _, refreshToken := newTestServer(t)
+	srv, _, refreshToken := newTestServer()
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("POST", "/op/execute", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+refreshToken)
@@ -130,7 +132,7 @@ func TestExecute_RefreshTokenRejectedForExecute(t *testing.T) {
 }
 
 func TestExecute_WrongMethod(t *testing.T) {
-	srv, accessToken, _ := newTestServer(t)
+	srv, accessToken, _ := newTestServer()
 	body, _ := json.Marshal(executor.Request{Args: []string{"account", "list"}})
 	req := httptest.NewRequest("GET", "/op/execute", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -172,7 +174,9 @@ func TestExecute_BlockedSubcommand(t *testing.T) {
 	}
 
 	var result executor.Result
-	json.NewDecoder(w.Body).Decode(&result)
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+		t.Fatalf("decoding execute response: %v", err)
+	}
 	if result.ExitCode != 1 {
 		t.Errorf("exit_code = %d, want 1", result.ExitCode)
 	}
@@ -182,7 +186,7 @@ func TestExecute_BlockedSubcommand(t *testing.T) {
 }
 
 func TestAuthenticate_MissingHeader(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+	srv, _, _ := newTestServer()
 	req := httptest.NewRequest("POST", "/op/execute", nil)
 
 	if srv.authenticate(req) {
@@ -191,7 +195,7 @@ func TestAuthenticate_MissingHeader(t *testing.T) {
 }
 
 func TestAuthenticate_InvalidScheme(t *testing.T) {
-	srv, accessToken, _ := newTestServer(t)
+	srv, accessToken, _ := newTestServer()
 	req := httptest.NewRequest("POST", "/op/execute", nil)
 	req.Header.Set("Authorization", "Basic "+accessToken)
 
@@ -201,7 +205,7 @@ func TestAuthenticate_InvalidScheme(t *testing.T) {
 }
 
 func TestAuthenticate_ValidToken(t *testing.T) {
-	srv, accessToken, _ := newTestServer(t)
+	srv, accessToken, _ := newTestServer()
 	req := httptest.NewRequest("POST", "/op/execute", nil)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
@@ -277,7 +281,9 @@ func TestTokenRefresh_ExpiredRefreshToken(t *testing.T) {
 	}
 
 	var resp map[string]string
-	json.NewDecoder(w.Body).Decode(&resp)
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding token refresh error response: %v", err)
+	}
 	if resp["error"] != "refresh_token_expired" {
 		t.Errorf("error = %q, want 'refresh_token_expired'", resp["error"])
 	}
@@ -287,7 +293,7 @@ func TestTokenRefresh_ExpiredRefreshToken(t *testing.T) {
 }
 
 func TestTokenRefresh_InvalidRefreshToken(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+	srv, _, _ := newTestServer()
 	req := httptest.NewRequest("POST", "/token/refresh", nil)
 	req.Header.Set("Authorization", "Bearer totally-wrong-token")
 	w := httptest.NewRecorder()
@@ -300,7 +306,7 @@ func TestTokenRefresh_InvalidRefreshToken(t *testing.T) {
 }
 
 func TestTokenRefresh_WrongMethod(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+	srv, _, _ := newTestServer()
 	req := httptest.NewRequest("GET", "/token/refresh", nil)
 	w := httptest.NewRecorder()
 
@@ -312,7 +318,7 @@ func TestTokenRefresh_WrongMethod(t *testing.T) {
 }
 
 func TestTokenRefresh_NoAuth(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+	srv, _, _ := newTestServer()
 	req := httptest.NewRequest("POST", "/token/refresh", nil)
 	w := httptest.NewRecorder()
 
@@ -337,7 +343,9 @@ func TestTokenRefresh_SlidingExpiry(t *testing.T) {
 	}
 
 	var resp TokenRefreshResponse
-	json.NewDecoder(w.Body).Decode(&resp)
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding token refresh response: %v", err)
+	}
 
 	expires, err := time.Parse(time.RFC3339, resp.RefreshExpires)
 	if err != nil {
@@ -440,7 +448,9 @@ func TestExecute_VersionNegotiation_UpgradeRequired(t *testing.T) {
 	}
 
 	var resp map[string]string
-	json.NewDecoder(w.Body).Decode(&resp)
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding upgrade-required response: %v", err)
+	}
 	if resp["error"] == "" {
 		t.Error("response should contain an error message")
 	}

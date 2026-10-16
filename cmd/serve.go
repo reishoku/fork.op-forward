@@ -5,15 +5,24 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/reishoku/fork.op-forward/internal/transport"
-
 	"github.com/reishoku/fork.op-forward/internal/auth"
 	"github.com/reishoku/fork.op-forward/internal/daemon"
+	"github.com/reishoku/fork.op-forward/internal/endpoint"
 )
 
 func runServe() error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	fs.Parse(os.Args[2:])
+	listen := fs.String("listen", os.Getenv(endpoint.EnvListen), "Listen endpoint: tcp://127.0.0.1:port or unix:///path.sock (overrides --port; default: Unix socket, see OP_FORWARD_SOCKET_PATH)")
+	port := fs.Int("port", endpoint.PortFromEnv(), "Loopback TCP port to listen on (selects TCP instead of the default Unix socket)")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		return err
+	}
+
+	explicit := explicitFlags(fs)
+	ep, err := endpoint.ForListen(endpointArg(*listen, explicit, "port"), *port, tcpShorthand(explicit, "port"))
+	if err != nil {
+		return err
+	}
 
 	// Migrate legacy session.token → refresh.token if upgrading from the
 	// single-token system.
@@ -49,15 +58,15 @@ func runServe() error {
 	// Write the access token to the legacy session.token path so that older
 	// proxy clients that read session.token continue to work until upgraded.
 	if legacyPath, err := auth.LegacyTokenPath(); err == nil {
-		auth.SaveToPath(accessToken, legacyPath)
+		// The legacy file only serves older clients, so a failed write is
+		// reported but must not prevent the daemon from starting.
+		if err := auth.SaveToPath(accessToken, legacyPath); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not write legacy session token: %v\n", err)
+		}
 	}
 
-	socketPath, err := transport.SocketPath()
-	if err != nil {
-		return fmt.Errorf("socket path: %w", err)
-	}
-	fmt.Printf("Starting daemon on unix://%s\n", socketPath)
+	fmt.Printf("Starting daemon on %s\n", ep)
 
-	server := daemon.New(accessToken, refreshToken, socketPath, Version)
+	server := daemon.New(accessToken, refreshToken, ep, Version)
 	return server.Start()
 }
