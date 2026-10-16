@@ -58,7 +58,7 @@ op-forward serve
 op-forward service install
 ```
 
-The daemon listens on the Unix domain socket `~/Library/Caches/op-forward/op-forward.sock` by default (`$XDG_RUNTIME_DIR/op-forward.sock` when `XDG_RUNTIME_DIR` is set; override with `OP_FORWARD_SOCKET_PATH`) and generates bearer tokens under `~/Library/Caches/op-forward/`. To listen on loopback TCP instead, see [Transports](#transports).
+The daemon listens on the Unix domain socket `~/Library/Caches/op-forward/op-forward.sock` by default (`$XDG_RUNTIME_DIR/op-forward.sock` when `XDG_RUNTIME_DIR` is set; override with `OP_FORWARD_SOCKET_PATH`) and generates bearer tokens under `~/Library/Caches/op-forward/` (`$XDG_STATE_HOME/op-forward/` when `XDG_STATE_HOME` is set). To listen on loopback TCP instead, see [Transports](#transports).
 
 ### Set up the remote side (VM / Linux)
 
@@ -105,9 +105,10 @@ Then, on every remote system:
 op-forward install
 ```
 
-Packages install the binary to `/usr/bin/op-forward`. Upgrading from a
-release before 0.7.2, which used `/usr/local/bin`, requires re-running
-`op-forward install` once so the shim picks up the new location.
+Packages install the binary to `/usr/bin/op-forward`. Releases before 0.7.2
+used `/usr/local/bin`; the package's post-install script rewrites shims under
+`/home/*/.local/bin/op` and `/root/.local/bin/op` to the new location, so
+re-running `op-forward install` is needed only for a shim elsewhere.
 Upgrades afterwards go through the package manager
 (`apt-get upgrade`, `dnf upgrade`, `apk upgrade`).
 
@@ -115,7 +116,9 @@ After installing, deploy the auth token and start the SSH tunnel:
 
 ```bash
 # Deploy the refresh token (from host). The remote fetches its own
-# short-lived access token from the daemon on first use.
+# short-lived access token from the daemon on first use. scp does not create
+# the remote directory.
+ssh vm 'mkdir -p -m 700 ~/.cache/op-forward'
 scp ~/Library/Caches/op-forward/refresh.token vm:~/.cache/op-forward/refresh.token
 ```
 
@@ -201,7 +204,7 @@ container (`docker run` fails at mount time with `operation not supported`).
 | `OP_FORWARD_SOCKET_PATH` | `$XDG_RUNTIME_DIR/op-forward.sock`, else `<cache dir>/op-forward/op-forward.sock` | Default socket path, used by both sides when neither the full endpoint form nor the TCP shorthand is set. Must be absolute. |
 | `OP_FORWARD_PORT` | unset (`18340` when TCP is selected) | TCP port shorthand. Setting it selects loopback TCP on both sides when the full endpoint form is unset. |
 | `OP_FORWARD_HOST` | unset (`127.0.0.1` when TCP is selected) | TCP host shorthand for the shim; setting it selects TCP. Set to `host.docker.internal` to reach the host from a Docker Desktop container without an SSH tunnel. Never used by the daemon. |
-| `OP_FORWARD_TOKEN_DIR` | `$XDG_STATE_HOME/op-forward` if `XDG_STATE_HOME` is set, else `~/Library/Caches/op-forward` (macOS) / `~/.cache/op-forward` (Linux) | Token storage directory. Token files are read and written through Go's traversal-resistant `os.Root` API, confined to this directory. |
+| `OP_FORWARD_TOKEN_DIR` | `$XDG_STATE_HOME/op-forward` if `XDG_STATE_HOME` is set, else `~/Library/Caches/op-forward` (macOS) / `~/.cache/op-forward` (Linux) | Token storage directory. The daemon reads and writes token files through Go's traversal-resistant `os.Root` API, confined to this directory; the proxy's token cache uses plain file I/O. |
 | `OP_FORWARD_TOKEN_FILE` | `$TOKEN_DIR/access.token` | Full path to the access token file (applies to the access token only) |
 | `OP_FORWARD_PROBE_TIMEOUT_MS` | `500` | How long the shim waits for the daemon to accept a connection before falling back to the local `op` |
 | `OP_FORWARD_FETCH_TIMEOUT_MS` | `60000` | Shim HTTP request timeout |
@@ -231,7 +234,7 @@ Additional layers:
 - **No shell execution**: Commands are executed via `os/exec` (direct exec), not through a shell. Shell injection is structurally impossible.
 - **Argument sanitization**: Arguments containing shell metacharacters (`` ` ``, `$`, `|`, `;`, `&`, newlines) are rejected before execution.
 - **Blocked subcommands**: `signin`, `signout`, `update`, and `completion` are blocked — they either require interactive input or would modify the host's op configuration.
-- **Audit logging**: All commands are logged with sensitive arguments (`--password`, `--reveal`) redacted.
+- **Audit logging**: All commands are logged; the value following `--password` or `-p` is logged as `[REDACTED]`.
 
 ### What this does NOT protect against
 
@@ -299,8 +302,9 @@ brew upgrade reishoku/tap/op-forward
 If installed from a package repository, use the package manager
 (`apt-get upgrade op-forward`, `dnf upgrade op-forward`, `apk upgrade op-forward`).
 
-The Homebrew formula and every package repository are updated automatically
-on each release.
+The Homebrew formula, the AUR package, and the package repositories are updated
+on each release when their secrets are configured (`HOMEBREW_TAP_TOKEN`,
+`AUR_SSH_PRIVATE_KEY`, and `APK_RSA_PRIVATE_KEY` for the Alpine repository).
 
 ## Building
 
