@@ -11,10 +11,10 @@ import (
 )
 
 func runServe() error {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := fs.String("listen", os.Getenv(endpoint.EnvListen), "Listen endpoint: tcp://127.0.0.1:port or unix:///path.sock (overrides --port; default: Unix socket, see OP_FORWARD_SOCKET_PATH)")
 	port := fs.Int("port", endpoint.PortFromEnv(), "Loopback TCP port to listen on (selects TCP instead of the default Unix socket)")
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	if err := parseFlags(fs, os.Args[2:]); err != nil {
 		return err
 	}
 
@@ -44,10 +44,7 @@ func runServe() error {
 	fmt.Printf("Refresh token at: %s\n", refreshPath)
 
 	// Always generate a fresh access token on startup (1-hour TTL).
-	accessToken, err := auth.GenerateAccess()
-	if err != nil {
-		return fmt.Errorf("access token setup: %w", err)
-	}
+	accessToken := auth.GenerateAccess()
 	accessPath, _ := auth.AccessTokenPath()
 	if err := auth.SaveToPath(accessToken, accessPath); err != nil {
 		return fmt.Errorf("saving access token: %w", err)

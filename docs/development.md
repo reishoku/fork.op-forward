@@ -2,7 +2,7 @@
 
 This page covers building and testing op-forward, the packaging pipeline, the
 package repositories, and the release and recovery workflows. The current release
-line is v0.7.x (latest tag v0.7.3).
+line is v1.x (latest tag v1.0.0).
 
 ## Requirements
 
@@ -23,8 +23,8 @@ has platform files for each ([pty_darwin.go](../internal/executor/pty_darwin.go)
 
 ```bash
 make build                 # ./op-forward for this platform
-make build VERSION=0.7.3   # stamp a version
-make build-all VERSION=0.7.3
+make build VERSION=1.0.0   # stamp a version
+make build-all VERSION=1.0.0
 make test
 make clean
 ```
@@ -83,8 +83,8 @@ keeping ownership and mode.
 ### Building packages
 
 ```bash
-make build-all VERSION=0.7.3
-scripts/build-packages.sh 0.7.3 dist pkg-out
+make build-all VERSION=1.0.0
+scripts/build-packages.sh 1.0.0 dist pkg-out
 ```
 
 [scripts/build-packages.sh](../scripts/build-packages.sh) takes the version, the
@@ -103,7 +103,7 @@ for each of `deb`, `rpm`, `apk`, and `archlinux`. Output names:
 ### Testing packages
 
 ```bash
-scripts/test-packages.sh 0.7.3 pkg-out [arch]
+scripts/test-packages.sh 1.0.0 pkg-out [arch]
 ```
 
 [scripts/test-packages.sh](../scripts/test-packages.sh) is the acceptance test. For
@@ -271,11 +271,10 @@ below `0.7.3`; makepkg rejects a hyphen in `pkgver`; apk rejects both `-` and
 [scripts/test-packages.sh](../scripts/test-packages.sh) builds file names from
 the raw version.
 
-This fork numbers its own releases in a separate minor series starting at
-`v0.8.0`, so a fork release never shares a tag with a different upstream
-release. The release notes name the upstream version each fork release is based
-on. If upstream reaches `0.8`, the series is reconsidered before the next fork
-release. Raising the minimum
+Fork releases use plain `X.Y.Z` tags in a series that does not collide with
+upstream's tags, so a fork release never shares a tag with a different upstream
+release. The series is chosen at the first fork release, and the release notes
+name the upstream version each fork release is based on. Raising the minimum
 accepted client version is a source change to `MinClientVersion` in
 [internal/daemon/server.go](../internal/daemon/server.go).
 
@@ -283,12 +282,13 @@ accepted client version is a source change to `MinClientVersion` in
 
 This is a fork. The conventions:
 
-- **`reishoku`** is the active branch and the GitHub default. CI runs
-  against it; releases are tagged on it.
-- **`main`** tracks upstream `ekovshilovsky/op-forward`. Do not commit to
-  `main` directly; it exists to resolve diffs from upstream.
-- Upstream changes are brought in by merging upstream `main` into a topic
-  branch and opening a PR against `reishoku`.
+- **`reishoku`** is the active branch, the GitHub default, and the base
+  branch for every PR. CI runs against it; releases are tagged on it.
+- Upstream is not mirrored into a branch of this repository. Add it as a
+  remote (`git remote add upstream https://github.com/ekovshilovsky/op-forward`),
+  merge `upstream/main` into a topic branch, and open a PR against `reishoku`
+  that is merged with a merge commit, so upstream stays an ancestor and the
+  next sync carries only the new diff.
 - Topic branches (`docs/...`, `feat/...`, `fix/...`) merge into
   `reishoku` via PR.
 - Releases are tagged `v<x>.<y>.<z>` on the `reishoku` branch.

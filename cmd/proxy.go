@@ -32,13 +32,19 @@ const proxyExitInfraFailure = 127
 //  2. On HTTP 401, attempt a token refresh using the refresh token.
 //  3. On successful refresh, save both new tokens and retry the request.
 //  4. On failed refresh, print a clear error and exit.
+//
+// Exit contract, which the op shim depends on: every infrastructure failure
+// prints its diagnostic to stderr and returns ExitStatus(127), so the shim
+// falls back to the real op binary. A completed round trip returns the exit
+// code of the forwarded op command as-is (nil for zero). Flag errors return
+// ExitStatus(2), and a help request returns ExitStatus(0).
 func runProxy() error {
-	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	addr := fs.String("addr", os.Getenv(endpoint.EnvAddr), "Daemon endpoint: tcp://host:port or unix:///path.sock (overrides --host/--port; default: Unix socket, see OP_FORWARD_SOCKET_PATH)")
 	port := fs.Int("port", endpoint.PortFromEnv(), "Daemon TCP port (selects TCP instead of the default Unix socket)")
 	host := fs.String("host", endpoint.HostFromEnv(), "Daemon TCP host (selects TCP instead of the default Unix socket; set to host.docker.internal for Docker Desktop containers)")
 	timeoutMs := fs.Int("timeout", getProxyTimeout(), "Request timeout in milliseconds")
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	if err := parseFlags(fs, os.Args[2:]); err != nil {
 		return err
 	}
 
@@ -48,7 +54,7 @@ func runProxy() error {
 	ep, err := endpoint.ForDial(endpointArg(*addr, explicit, "host", "port"), *host, *port, tcpShorthand(explicit, "host", "port"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "op-forward: %v\n", err)
-		os.Exit(proxyExitInfraFailure)
+		return ExitStatus(proxyExitInfraFailure)
 	}
 
 	// Resolve token file paths.
@@ -66,7 +72,7 @@ func runProxy() error {
 		// No access token at all — check for a refresh token.
 		if readTokenValue(refreshPath) == "" {
 			printNoTokenError()
-			os.Exit(proxyExitInfraFailure)
+			return ExitStatus(proxyExitInfraFailure)
 		}
 		// Fall through — accessValid is false, will trigger refresh below.
 	}
@@ -75,7 +81,7 @@ func runProxy() error {
 	// tunnel fails fast and the shim can fall back to the local op binary.
 	if err := ep.Probe(time.Duration(getProbeTimeoutMs()) * time.Millisecond); err != nil {
 		fmt.Fprintf(os.Stderr, "op-forward: daemon not reachable at %s\n", ep)
-		os.Exit(proxyExitInfraFailure)
+		return ExitStatus(proxyExitInfraFailure)
 	}
 
 	// Build the request body.
@@ -83,11 +89,9 @@ func runProxy() error {
 		Args:      args,
 		TimeoutMs: *timeoutMs,
 	}
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "op-forward: encoding request: %v\n", err)
-		os.Exit(proxyExitInfraFailure)
-	}
+	// Marshaling a struct of a string slice and an int cannot fail, so the
+	// error is discarded rather than guarded with unreachable handling.
+	bodyBytes, _ := json.Marshal(reqBody)
 
 	httpTimeout := time.Duration(*timeoutMs)*time.Millisecond + 5*time.Second
 	client := ep.HTTPClient(httpTimeout)
@@ -101,7 +105,7 @@ func runProxy() error {
 		resp, respBody, err = executeWithAuth(client, ep, bodyBytes, accessToken)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "op-forward: %v\n", err)
-			os.Exit(proxyExitInfraFailure)
+			return ExitStatus(proxyExitInfraFailure)
 		}
 	}
 
@@ -118,14 +122,14 @@ func runProxy() error {
 		}
 		if refreshToken == "" {
 			printNoTokenError()
-			os.Exit(proxyExitInfraFailure)
+			return ExitStatus(proxyExitInfraFailure)
 		}
 
 		newTokens, refreshErr := attemptRefresh(client, ep, refreshToken)
 		if refreshErr != nil {
 			// Refresh failed — print actionable error and exit.
 			printRefreshFailedError(refreshErr)
-			os.Exit(proxyExitInfraFailure)
+			return ExitStatus(proxyExitInfraFailure)
 		}
 
 		// Save both new tokens to disk.
@@ -136,7 +140,7 @@ func runProxy() error {
 		resp, respBody, err = executeWithAuth(client, ep, bodyBytes, newTokens.AccessToken)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "op-forward: %v\n", err)
-			os.Exit(proxyExitInfraFailure)
+			return ExitStatus(proxyExitInfraFailure)
 		}
 	}
 
@@ -150,20 +154,20 @@ func runProxy() error {
 	// minimum version and must update before further commands.
 	if resp.StatusCode == http.StatusUpgradeRequired {
 		fmt.Fprintf(os.Stderr, "op-forward: %s\n", string(respBody))
-		os.Exit(proxyExitInfraFailure)
+		return ExitStatus(proxyExitInfraFailure)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		fmt.Fprintf(os.Stderr, "op-forward: daemon returned HTTP %d\n", resp.StatusCode)
 		fmt.Fprint(os.Stderr, string(respBody))
-		os.Exit(proxyExitInfraFailure)
+		return ExitStatus(proxyExitInfraFailure)
 	}
 
 	// Parse JSON response
 	var result executor.Result
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		fmt.Fprintf(os.Stderr, "op-forward: parsing response: %v\n", err)
-		os.Exit(proxyExitInfraFailure)
+		return ExitStatus(proxyExitInfraFailure)
 	}
 
 	// Relay op command output and exit code as-is
@@ -176,8 +180,10 @@ func runProxy() error {
 	if result.Stderr != "" {
 		fmt.Fprint(os.Stderr, result.Stderr)
 	}
-	os.Exit(result.ExitCode)
-	return nil // unreachable
+	if result.ExitCode == 0 {
+		return nil
+	}
+	return ExitStatus(result.ExitCode)
 }
 
 // executeWithAuth sends a POST to /op/execute with the given bearer token.
@@ -297,10 +303,9 @@ func readToken(path string) (value string, valid bool) {
 	if err != nil {
 		return "", false
 	}
+	// SplitN with a positive count always yields at least one element, so
+	// the first line can be taken unconditionally.
 	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
-	if len(lines) == 0 {
-		return "", false
-	}
 	val := lines[0]
 	if len(lines) < 2 {
 		return val, false
