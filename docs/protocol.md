@@ -171,7 +171,10 @@ produced. Lifetimes and rotation semantics are in [tokens.md](tokens.md#refresh-
 | 401 | JSON with `error` set to `refresh_token_expired` and a human-readable `message` | The bearer value does not match the daemon's current refresh token, or that token has expired |
 | 403 | `forbidden` | Unix peer uid differs from the daemon's uid |
 | 405 | `method not allowed` | Method other than `POST` |
-| 500 | `internal error` | Token generation failed |
+
+Token generation cannot fail, and a failure to save the new tokens to the
+daemon's files is only logged (`warning: failed to save ...`); the response is
+still 200.
 
 `X-Client-Version` is sent on refresh requests but not evaluated, so an
 out-of-date client can still refresh.
@@ -187,7 +190,7 @@ out-of-date client can still refresh.
 | 404 | unknown path | No such route |
 | 405 | execute, refresh | Wrong HTTP method |
 | 426 | execute | Client below the minimum version |
-| 500 | execute, refresh | Server-side failure |
+| 500 | execute | Server-side failure (the executor could not run `op`) |
 
 The proxy treats every status other than 200 on execute as an infrastructure
 failure: it prints `daemon returned HTTP N` and the body to stderr and exits 127
@@ -204,7 +207,7 @@ The exit status a caller of the shim observes is determined as follows:
 | 1 | `exit_code` in the response | The daemon rejected the request during argument validation; the reason is on stderr |
 | 124 | `exit_code` in the response | The command exceeded its host-side timeout |
 | 127 | the proxy | Infrastructure failure; the shim reacts by running the real `op` |
-| 1 | the shim | Proxy returned 127 and no fallback `op` binary is recorded or executable; prints `op-forward: proxy unavailable and no fallback op binary` |
+| 1 | the shim | The proxy returned 127, or no executable `op-forward` binary was found, and no fallback `op` binary is recorded or executable; prints `op-forward: proxy unavailable and no fallback op binary` |
 | 2 | the proxy | Command-line flag error (the proxy's flag parser exits with 2) |
 
 The proxy returns 127 for: an unparsable endpoint, no token files, a daemon that

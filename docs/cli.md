@@ -25,8 +25,9 @@ Behavior of the dispatcher:
 
 - With no arguments it prints the usage text and exits 0.
 - `help`, `--help`, and `-h` print the usage text and exit 0.
-- An unknown subcommand prints `Unknown command: NAME` to stderr, then the usage
-  text, and exits 1.
+- An unknown subcommand prints `Unknown command: NAME` to stderr and the usage
+  text to stdout, then a second line `unknown command: NAME` on stderr, and
+  exits 1.
 - The subcommands that take flags use Go's `flag` package with
   exit-on-error behavior: a flag error prints a message and usage and exits 2,
   and `-h` after a subcommand prints that subcommand's flags and exits 0.
@@ -49,7 +50,10 @@ Precedence between these and the environment is described in
 [configuration.md](configuration.md#precedence-rules).
 
 On startup it migrates a legacy `session.token`, loads or generates the refresh
-token, generates and writes a fresh access token, and prints their locations:
+token, generates and writes a fresh access token, and prints their locations. It
+also writes the access token to the legacy `session.token` path for older
+clients; a failure there only prints `warning: could not write legacy session
+token: ...`:
 
 ```
 Refresh token reused (expires 2026-11-15T14:30:00-07:00)
@@ -143,17 +147,19 @@ op-forward service install
 op-forward service uninstall
 ```
 
-Manages a launchd LaunchAgent for the daemon. Available on macOS only; elsewhere
-the command fails with `service management is only supported on macOS`. With no
-second word it prints `Usage: op-forward service [install|uninstall]`; any other
-word is an error (`unknown service command: NAME`). No flags are accepted.
+Manages a launchd LaunchAgent for the daemon. With no second word it prints
+`Usage: op-forward service [install|uninstall]` and exits 0 on any platform.
+With a second word, platforms other than macOS fail with `service management is
+only supported on macOS`; on macOS any word other than `install` or `uninstall`
+is an error (`unknown service command: NAME`). No flags are accepted.
 
 ### service install
 
 1. Resolve the path of the running binary, following symlinks.
 2. Resolve the listen endpoint now, from `OP_FORWARD_LISTEN`,
-   `OP_FORWARD_PORT`, or `OP_FORWARD_SOCKET_PATH` in the current environment
-   (default: the Unix socket `~/Library/Caches/op-forward/op-forward.sock`).
+   `OP_FORWARD_PORT`, `OP_FORWARD_SOCKET_PATH`, or an absolute
+   `XDG_RUNTIME_DIR` in the current environment (default: the Unix socket
+   `~/Library/Caches/op-forward/op-forward.sock`).
    launchd does not inherit the shell environment, so the endpoint is written
    into the plist.
 3. Write `~/Library/LaunchAgents/com.op-forward.daemon.plist`. Its program
@@ -204,8 +210,9 @@ Replaces the running binary with the latest GitHub release.
 
 Points to know:
 
-- The endpoint polled in step 6 is resolved from `OP_FORWARD_LISTEN` and
-  `OP_FORWARD_PORT` in the environment of the `update` command. If the daemon
+- The endpoint polled in step 6 is resolved from `OP_FORWARD_LISTEN`,
+  `OP_FORWARD_PORT`, and, for the default Unix socket, `OP_FORWARD_SOCKET_PATH`
+  and `XDG_RUNTIME_DIR` in the environment of the `update` command. If the daemon
   was installed with a different endpoint, set the same variables when running
   `update`.
 - The daemon is expected to be restarted by a supervisor. launchd's `KeepAlive`

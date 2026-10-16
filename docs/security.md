@@ -65,7 +65,7 @@ space is the protection against guessing.
 
 ### 4. No shell execution
 
-The executor runs `op` directly with `exec.Command(opPath, args...)`. Arguments
+The executor runs `op` directly with `exec.CommandContext(ctx, opPath, args...)`, started under a PTY. Arguments
 are passed as an argument vector, never interpreted by a shell. The path to `op`
 is found with `exec.LookPath("op")` in the daemon's environment; under the
 launchd service the `PATH` is

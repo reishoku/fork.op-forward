@@ -26,17 +26,18 @@
 // daemon and OP_FORWARD_ADDR the proxy; the --listen and --addr flags
 // override them. OP_FORWARD_HOST and OP_FORWARD_PORT remain supported as
 // shorthand for a TCP endpoint and are consulted only when the full form is
-// unset; setting either selects TCP. Without any configuration both sides use
-// the Unix socket at OP_FORWARD_SOCKET_PATH, else
-// $XDG_RUNTIME_DIR/op-forward.sock, else op-forward/op-forward.sock in the
-// user cache directory.
+// unset; setting either selects TCP, and a --host or --port typed on the
+// command line overrides a full form taken from the environment. Without any
+// configuration both sides use the Unix socket at OP_FORWARD_SOCKET_PATH, else
+// $XDG_RUNTIME_DIR/op-forward.sock when XDG_RUNTIME_DIR is absolute, else
+// op-forward/op-forward.sock in the user cache directory.
 //
 // # Authentication
 //
 // The daemon issues a short-lived access token and a sliding refresh token,
 // stored under $XDG_STATE_HOME/op-forward when XDG_STATE_HOME is set and the
-// invoking user's cache directory otherwise (overridden with
-// OP_FORWARD_TOKEN_DIR or OP_FORWARD_TOKEN_FILE). The proxy attaches the
+// invoking user's cache directory otherwise. OP_FORWARD_TOKEN_DIR overrides
+// the directory, and OP_FORWARD_TOKEN_FILE the access token file only. The proxy attaches the
 // access token as a bearer credential and refreshes it transparently when it
 // expires. Interactive and configuration-changing op subcommands are refused
 // by the daemon.

@@ -132,7 +132,7 @@ details are in [cli.md](cli.md).
 | Item | macOS | Linux |
 |---|---|---|
 | Token directory | `$XDG_STATE_HOME/op-forward` if set, else `~/Library/Caches/op-forward` | `$XDG_STATE_HOME/op-forward` if set, else `$XDG_CACHE_HOME/op-forward` if set, else `~/.cache/op-forward` |
-| Default socket | `$XDG_RUNTIME_DIR/op-forward.sock` if set, else `~/Library/Caches/op-forward/op-forward.sock` | `$XDG_RUNTIME_DIR/op-forward.sock` if set, else `$XDG_CACHE_HOME/op-forward/op-forward.sock` if set, else `~/.cache/op-forward/op-forward.sock` |
+| Default socket | `$OP_FORWARD_SOCKET_PATH` if set, else `$XDG_RUNTIME_DIR/op-forward.sock` if `XDG_RUNTIME_DIR` is absolute, else `~/Library/Caches/op-forward/op-forward.sock` | `$OP_FORWARD_SOCKET_PATH` if set, else `$XDG_RUNTIME_DIR/op-forward.sock` if `XDG_RUNTIME_DIR` is absolute, else `$XDG_CACHE_HOME/op-forward/op-forward.sock` if set, else `~/.cache/op-forward/op-forward.sock` |
 | LaunchAgent plist | `~/Library/LaunchAgents/com.op-forward.daemon.plist` | not applicable |
 | Daemon log under launchd | `~/Library/Logs/op-forward.log` | not applicable |
 | Shim | `~/.local/bin/op` | `~/.local/bin/op` |

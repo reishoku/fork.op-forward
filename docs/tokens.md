@@ -77,8 +77,9 @@ ignores. With no home directory the result is the relative path
 directory rather than a fixed location.
 
 The launchd service does not copy the installing shell's environment, so
-`OP_FORWARD_TOKEN_DIR` and `OP_FORWARD_TOKEN_FILE` exported before
-`op-forward service install` are not seen by the service. Only the endpoint is
+`OP_FORWARD_TOKEN_DIR`, `OP_FORWARD_TOKEN_FILE`, and `XDG_STATE_HOME` exported
+before `op-forward service install` are not seen by the service, which uses
+`~/Library/Caches/op-forward`. Only the endpoint is
 resolved at install time (see [deployment.md](deployment.md#launchd-service)).
 
 ## Daemon startup
@@ -86,8 +87,10 @@ resolved at install time (see [deployment.md](deployment.md#launchd-service)).
 `op-forward serve` performs these steps in order
 ([cmd/serve.go](../cmd/serve.go)):
 
-1. Resolve the endpoint. An invalid endpoint stops startup before any token is
-   written.
+1. Resolve the endpoint. An unparsable endpoint stops startup before any token
+   is written. The bind-time checks (a non-loopback TCP host, an unsafe socket
+   directory, a socket already in use) fail only at step 6, after the token
+   files have been written.
 2. Run `MigrateLegacyToken` (see below). A migration error is printed as a
    warning and startup continues.
 3. Load the refresh token with `LoadOrGenerateRefresh`. If `refresh.token`
@@ -97,8 +100,9 @@ resolved at install time (see [deployment.md](deployment.md#launchd-service)).
    existing token found)`, followed by the file path.
 4. Generate a new access token, save it to the access token path, and print its
    path and expiry. A previously issued access token never survives a restart.
-5. Write the same access token to `session.token`, ignoring failures, so that
-   clients that still read the legacy file continue to work.
+5. Write the same access token to `session.token`, so that clients that still
+   read the legacy file continue to work. A failure prints `warning: could not
+   write legacy session token: ...` and startup continues.
 6. Open the listener and serve.
 
 The daemon reads token files only at startup. After that, authentication uses
@@ -216,8 +220,10 @@ The message text stored in the daemon's 401 response refers to a refresh token
 unused for more than 30 days and a restarted daemon; the condition that
 produces the response is broader, as the first row states.
 
-Remedy: copy the host's current `refresh.token` to the remote token directory,
-for example:
+Remedy: copy the host's current `refresh.token` to the remote token directory.
+The destination must be the client's resolved token directory (see
+[File locations and precedence](#file-locations-and-precedence)), for example
+`$XDG_STATE_HOME/op-forward/` when `XDG_STATE_HOME` is set; otherwise:
 
 ```bash
 scp host:~/Library/Caches/op-forward/refresh.token ~/.cache/op-forward/refresh.token
