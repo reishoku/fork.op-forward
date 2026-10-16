@@ -8,10 +8,7 @@ import (
 )
 
 func TestGenerateAccess(t *testing.T) {
-	token, err := GenerateAccess()
-	if err != nil {
-		t.Fatalf("GenerateAccess() error: %v", err)
-	}
+	token := GenerateAccess()
 	if len(token.Value) != TokenLength*2 {
 		t.Errorf("token length = %d, want %d hex chars", len(token.Value), TokenLength*2)
 	}
@@ -24,10 +21,7 @@ func TestGenerateAccess(t *testing.T) {
 }
 
 func TestGenerateRefresh(t *testing.T) {
-	token, err := GenerateRefresh()
-	if err != nil {
-		t.Fatalf("GenerateRefresh() error: %v", err)
-	}
+	token := GenerateRefresh()
 	if len(token.Value) != TokenLength*2 {
 		t.Errorf("token length = %d, want %d hex chars", len(token.Value), TokenLength*2)
 	}
@@ -37,8 +31,8 @@ func TestGenerateRefresh(t *testing.T) {
 }
 
 func TestGenerateUniqueness(t *testing.T) {
-	t1, _ := GenerateAccess()
-	t2, _ := GenerateAccess()
+	t1 := GenerateAccess()
+	t2 := GenerateAccess()
 	if t1.Value == t2.Value {
 		t.Error("two generated tokens should not be identical")
 	}
@@ -108,7 +102,7 @@ func TestSaveToPathAndLoadFromPath(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "test.token")
 
-	original, _ := GenerateAccess()
+	original := GenerateAccess()
 	if err := SaveToPath(original, path); err != nil {
 		t.Fatalf("SaveToPath() error: %v", err)
 	}
@@ -130,7 +124,7 @@ func TestSaveToPath_AtomicWrite(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "atomic.token")
 
-	token, _ := GenerateAccess()
+	token := GenerateAccess()
 	if err := SaveToPath(token, path); err != nil {
 		t.Fatalf("SaveToPath() error: %v", err)
 	}
@@ -153,7 +147,7 @@ func TestSaveAndLoad_BackwardCompat(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("OP_FORWARD_TOKEN_FILE", filepath.Join(tmpDir, "test.token"))
 
-	original, _ := GenerateAccess()
+	original := GenerateAccess()
 	if err := original.Save(); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
@@ -184,7 +178,9 @@ func TestLoadInvalidFormat(t *testing.T) {
 	tokenPath := filepath.Join(tmpDir, "bad.token")
 	t.Setenv("OP_FORWARD_TOKEN_FILE", tokenPath)
 
-	os.WriteFile(tokenPath, []byte("tokenvalue\n"), 0600)
+	if err := os.WriteFile(tokenPath, []byte("tokenvalue\n"), 0600); err != nil {
+		t.Fatalf("writing fixture token file: %v", err)
+	}
 	_, err := Load()
 	if err == nil {
 		t.Error("Load() should fail for single-line token file")
@@ -196,7 +192,9 @@ func TestLoadInvalidExpiry(t *testing.T) {
 	tokenPath := filepath.Join(tmpDir, "bad.token")
 	t.Setenv("OP_FORWARD_TOKEN_FILE", tokenPath)
 
-	os.WriteFile(tokenPath, []byte("tokenvalue\nnot-a-date\n"), 0600)
+	if err := os.WriteFile(tokenPath, []byte("tokenvalue\nnot-a-date\n"), 0600); err != nil {
+		t.Fatalf("writing fixture token file: %v", err)
+	}
 	_, err := Load()
 	if err == nil {
 		t.Error("Load() should fail for invalid expiry format")
@@ -223,8 +221,10 @@ func TestLoadOrGenerate_ExistingValid(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("OP_FORWARD_TOKEN_FILE", filepath.Join(tmpDir, "test.token"))
 
-	first, _ := GenerateAccess()
-	first.Save()
+	first := GenerateAccess()
+	if err := first.Save(); err != nil {
+		t.Fatalf("saving fixture token: %v", err)
+	}
 
 	loaded, isNew, err := LoadOrGenerate()
 	if err != nil {
@@ -244,7 +244,9 @@ func TestLoadOrGenerate_ExpiredToken(t *testing.T) {
 	t.Setenv("OP_FORWARD_TOKEN_FILE", tokenPath)
 
 	expired := &Token{Value: "expired", Expires: time.Now().Add(-time.Hour), TTL: AccessTokenTTL}
-	expired.Save()
+	if err := expired.Save(); err != nil {
+		t.Fatalf("saving fixture token: %v", err)
+	}
 
 	token, isNew, err := LoadOrGenerate()
 	if err != nil {
@@ -278,9 +280,11 @@ func TestLoadOrGenerateRefresh_ExistingValid(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("OP_FORWARD_TOKEN_DIR", tmpDir)
 
-	first, _ := GenerateRefresh()
+	first := GenerateRefresh()
 	path := filepath.Join(tmpDir, RefreshTokenFile)
-	SaveToPath(first, path)
+	if err := SaveToPath(first, path); err != nil {
+		t.Fatalf("saving fixture refresh token: %v", err)
+	}
 
 	loaded, isNew, err := LoadOrGenerateRefresh()
 	if err != nil {
@@ -299,9 +303,11 @@ func TestMigrateLegacyToken(t *testing.T) {
 	t.Setenv("OP_FORWARD_TOKEN_DIR", tmpDir)
 
 	// Write a legacy session.token.
-	legacy, _ := GenerateRefresh()
+	legacy := GenerateRefresh()
 	legacyPath := filepath.Join(tmpDir, LegacyTokenFile)
-	SaveToPath(legacy, legacyPath)
+	if err := SaveToPath(legacy, legacyPath); err != nil {
+		t.Fatalf("saving fixture legacy token: %v", err)
+	}
 
 	if err := MigrateLegacyToken(); err != nil {
 		t.Fatalf("MigrateLegacyToken() error: %v", err)
@@ -323,13 +329,17 @@ func TestMigrateLegacyToken_NoOpIfRefreshExists(t *testing.T) {
 	t.Setenv("OP_FORWARD_TOKEN_DIR", tmpDir)
 
 	// Write both files.
-	refresh, _ := GenerateRefresh()
+	refresh := GenerateRefresh()
 	refreshPath := filepath.Join(tmpDir, RefreshTokenFile)
-	SaveToPath(refresh, refreshPath)
+	if err := SaveToPath(refresh, refreshPath); err != nil {
+		t.Fatalf("saving fixture refresh token: %v", err)
+	}
 
-	legacy, _ := GenerateRefresh()
+	legacy := GenerateRefresh()
 	legacyPath := filepath.Join(tmpDir, LegacyTokenFile)
-	SaveToPath(legacy, legacyPath)
+	if err := SaveToPath(legacy, legacyPath); err != nil {
+		t.Fatalf("saving fixture legacy token: %v", err)
+	}
 
 	if err := MigrateLegacyToken(); err != nil {
 		t.Fatalf("MigrateLegacyToken() error: %v", err)
@@ -382,6 +392,84 @@ func TestTokenDir_EnvOverride(t *testing.T) {
 	}
 }
 
+// OP_FORWARD_TOKEN_DIR beats XDG_STATE_HOME, which beats the cache directory.
+func TestTokenDir_Precedence(t *testing.T) {
+	home := t.TempDir()
+	state := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("XDG_STATE_HOME", state)
+
+	t.Setenv("OP_FORWARD_TOKEN_DIR", "/custom/path")
+	if dir, err := TokenDir(); err != nil || dir != "/custom/path" {
+		t.Fatalf("with OP_FORWARD_TOKEN_DIR: TokenDir() = %q, %v", dir, err)
+	}
+
+	t.Setenv("OP_FORWARD_TOKEN_DIR", "")
+	if dir, err := TokenDir(); err != nil || dir != filepath.Join(state, CacheDirName) {
+		t.Fatalf("with XDG_STATE_HOME: TokenDir() = %q, %v; want %q", dir, err, filepath.Join(state, CacheDirName))
+	}
+
+	t.Setenv("XDG_STATE_HOME", "")
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir, err := TokenDir(); err != nil || dir != filepath.Join(cacheDir, CacheDirName) {
+		t.Fatalf("fallback: TokenDir() = %q, %v; want %q", dir, err, filepath.Join(cacheDir, CacheDirName))
+	}
+}
+
+// Token I/O goes through os.Root, so a token file that is a symlink leading
+// out of the token directory is neither read nor written through.
+func TestTokenIORefusesSymlinkEscape(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.token")
+	token := GenerateAccess()
+	if err := SaveToPath(token, outside); err != nil {
+		t.Fatalf("saving fixture token: %v", err)
+	}
+	link := filepath.Join(dir, "access.token")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := LoadFromPath(link); err == nil {
+		t.Fatal("LoadFromPath() followed a symlink out of the token directory")
+	}
+
+	before, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := GenerateAccess()
+	// The rename replaces the link itself; the target outside must not change.
+	if err := SaveToPath(other, link); err != nil {
+		t.Fatalf("SaveToPath() error: %v", err)
+	}
+	if after, err := os.ReadFile(outside); err != nil || string(after) != string(before) {
+		t.Fatalf("file outside the token directory changed: %q, %v", after, err)
+	}
+}
+
+// A path whose last element is not a plain file name (for example "/" or a
+// trailing "..") cannot be opened inside an os.Root, and is rejected before
+// any directory is created.
+func TestTokenIORejectsNonLocalFileName(t *testing.T) {
+	dir := t.TempDir()
+	for _, path := range []string{"/", filepath.Join(dir, "sub", "..")} {
+		if err := SaveToPath(GenerateAccess(), path); err == nil {
+			t.Errorf("SaveToPath(%q) succeeded, want an invalid filename error", path)
+		}
+		if _, err := LoadFromPath(path); err == nil {
+			t.Errorf("LoadFromPath(%q) succeeded, want an invalid filename error", path)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sub")); !os.IsNotExist(err) {
+		t.Errorf("a rejected path must not create directories (stat err: %v)", err)
+	}
+}
+
 func TestTokenPath_EnvOverride(t *testing.T) {
 	t.Setenv("OP_FORWARD_TOKEN_FILE", "/custom/token")
 	path, err := TokenPath()
@@ -397,8 +485,10 @@ func TestTokenFilePermissions(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "test.token")
 
-	token, _ := GenerateAccess()
-	SaveToPath(token, path)
+	token := GenerateAccess()
+	if err := SaveToPath(token, path); err != nil {
+		t.Fatalf("saving fixture token: %v", err)
+	}
 
 	info, err := os.Stat(path)
 	if err != nil {

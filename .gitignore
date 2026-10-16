@@ -5,3 +5,5 @@ op-forward-linux-amd64
 dist/
 *.tar.gz
 .DS_Store
+build/
+.findings/

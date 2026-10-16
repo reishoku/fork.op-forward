@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/reishoku/fork.op-forward/internal/endpoint"
 )
 
 // shimTemplate is the op wrapper script installed on the remote side.
@@ -20,8 +22,15 @@ const shimTemplate = `#!/bin/bash
 REAL_OP="{{REAL_OP}}"
 OP_FORWARD_BIN="{{OP_FORWARD_BIN}}"
 
+# The recorded path can go stale when a package upgrade relocates the
+# binary (0.7.1 and earlier installed to /usr/local/bin; packages now use
+# /usr/bin). Fall back to whatever op-forward is on PATH before giving up.
+if [ ! -x "$OP_FORWARD_BIN" ]; then
+  OP_FORWARD_BIN="$(command -v op-forward 2>/dev/null || true)"
+fi
+
 # Delegate to op-forward proxy (handles tunnel probe, auth, JSON, HTTP)
-if [ -x "$OP_FORWARD_BIN" ]; then
+if [ -n "$OP_FORWARD_BIN" ] && [ -x "$OP_FORWARD_BIN" ]; then
   "$OP_FORWARD_BIN" proxy -- "$@"
   EXIT=$?
   # Exit code 0 or op-level non-zero: use as-is
@@ -41,8 +50,14 @@ exit 1
 `
 
 func runInstall() error {
-	fs := flag.NewFlagSet("install", flag.ExitOnError)
-	fs.Parse(os.Args[2:])
+	fs := flag.NewFlagSet("install", flag.ContinueOnError)
+	// The shim reads OP_FORWARD_ADDR / OP_FORWARD_HOST / OP_FORWARD_PORT at
+	// run time, so nothing is baked in here. --port is accepted for scripts
+	// that still pass it.
+	_ = fs.Int("port", endpoint.PortFromEnv(), "Accepted for backward compatibility; the shim reads the environment at run time")
+	if err := parseFlags(fs, os.Args[2:]); err != nil {
+		return err
+	}
 
 	// Find the real op binary (before our shim shadows it)
 	realOp := findRealOp()
@@ -60,14 +75,14 @@ func runInstall() error {
 		}
 	}
 
+	// #nosec G301 -- ~/.local/bin is a PATH directory that must stay world-traversable like the standard user bin directory; it holds only the executable shim, never secrets
 	if err := os.MkdirAll(shimDir, 0755); err != nil {
 		return fmt.Errorf("creating shim directory: %w", err)
 	}
 
-	// Generate the shim script with paths to op-forward binary and real op
-	shim := strings.ReplaceAll(shimTemplate, "{{OP_FORWARD_BIN}}", opForwardBin)
-	shim = strings.ReplaceAll(shim, "{{REAL_OP}}", realOp)
+	shim := renderShim(opForwardBin, realOp)
 
+	// #nosec G306 -- the shim is an executable script that must carry the execute bit; it contains only binary paths and no secrets
 	if err := os.WriteFile(shimPath, []byte(shim), 0755); err != nil {
 		return fmt.Errorf("writing shim: %w", err)
 	}
@@ -89,6 +104,13 @@ func runInstall() error {
 	}
 
 	return nil
+}
+
+// renderShim fills the shim template with the op-forward binary path
+// recorded at install time and the real op binary to fall back to.
+func renderShim(opForwardBin, realOp string) string {
+	shim := strings.ReplaceAll(shimTemplate, "{{OP_FORWARD_BIN}}", opForwardBin)
+	return strings.ReplaceAll(shim, "{{REAL_OP}}", realOp)
 }
 
 // findRealOp locates the real op binary, skipping any existing shim.

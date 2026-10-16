@@ -14,6 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
+
+	"github.com/reishoku/fork.op-forward/internal/endpoint"
 )
 
 const (
@@ -31,7 +34,23 @@ type githubAsset struct {
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
 
+// daemonRespawnTimeout bounds how long an update waits for the respawned
+// daemon to answer its health endpoint.
+const daemonRespawnTimeout = 30 * time.Second
+
 func runUpdate() error {
+	return performUpdate(resolveExecutable, daemonRespawnTimeout)
+}
+
+// performUpdate runs the update workflow: it looks up the latest release,
+// downloads the archive for this platform, replaces the binary at the path
+// reported by resolve, and restarts the daemon when one is running.
+//
+// resolve is invoked only after the download has succeeded, so an up-to-date
+// installation or a failed download never depends on locating the running
+// executable. healthTimeout bounds how long the restarted daemon has to
+// answer its health endpoint.
+func performUpdate(resolve func() (string, error), healthTimeout time.Duration) error {
 	fmt.Printf("Current version: %s\n", Version)
 	fmt.Println("Checking for updates...")
 
@@ -53,14 +72,54 @@ func runUpdate() error {
 		return err
 	}
 
-	execPath, err := replaceBinary(newBinary)
+	execPath, err := resolve()
 	if err != nil {
+		return err
+	}
+	if err := replaceBinaryAt(execPath, newBinary); err != nil {
 		return err
 	}
 
 	fmt.Printf("Updated to v%s\n", latestVersion)
-	restartDaemon(execPath)
+	if restartDaemon(execPath) {
+		// launchd respawns the daemon with a short throttle, so the health
+		// endpoint is typically unreachable for several seconds. Report the
+		// outcome instead of leaving the user to discover a daemon that
+		// never came back.
+		ep, err := endpoint.ForListen(os.Getenv(endpoint.EnvListen), endpoint.PortFromEnv(), tcpShorthand(nil, "port"))
+		if err != nil {
+			return err
+		}
+		if err := waitForHealth(ep, healthTimeout); err != nil {
+			return fmt.Errorf("daemon did not come back on %s: %w\nCheck ~/Library/Logs/op-forward.log or restart with: launchctl kickstart -k gui/$(id -u)/com.op-forward.daemon", ep, err)
+		}
+		fmt.Printf("Daemon is serving again on %s\n", ep)
+	}
 	return nil
+}
+
+// waitForHealth polls the daemon's health endpoint until it answers or the
+// timeout elapses.
+func waitForHealth(ep endpoint.Endpoint, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := ep.HTTPClient(2 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(ep.BaseURL() + "/health")
+		if err == nil {
+			// The health probe only needs the status code, so the body is
+			// closed without being read and a close failure is irrelevant.
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+			lastErr = fmt.Errorf("health returned HTTP %d", resp.StatusCode)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("no healthy response within %s (last error: %v)", timeout, lastErr)
 }
 
 // fetchLatestRelease queries the GitHub API for the most recent release.
@@ -72,7 +131,8 @@ func fetchLatestRelease() (*githubRelease, error) {
 	if err != nil {
 		return nil, fmt.Errorf("checking for updates: %w", err)
 	}
-	defer resp.Body.Close()
+	// A close failure after reading the release metadata is not actionable.
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
@@ -104,11 +164,13 @@ func downloadReleaseBinary(release *githubRelease, version string) ([]byte, erro
 
 	fmt.Printf("Downloading %s...\n", wantName)
 
+	// #nosec G107 -- downloadURL is the browser_download_url of an asset in the release metadata fetched over TLS from the GitHub API for this project's compile-time repository constants
 	resp, err := http.Get(downloadURL)
 	if err != nil {
 		return nil, fmt.Errorf("downloading update: %w", err)
 	}
-	defer resp.Body.Close()
+	// A close failure after the archive has been consumed is not actionable.
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("download returned status %d", resp.StatusCode)
@@ -117,9 +179,9 @@ func downloadReleaseBinary(release *githubRelease, version string) ([]byte, erro
 	return extractBinaryFromTarGz(resp.Body)
 }
 
-// replaceBinary atomically replaces the running binary with new contents.
-// Returns the resolved path of the replaced binary.
-func replaceBinary(newBinary []byte) (string, error) {
+// resolveExecutable returns the symlink-resolved path of the running
+// binary, which is the file an update must replace.
+func resolveExecutable() (string, error) {
 	execPath, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("determining binary path: %w", err)
@@ -128,36 +190,48 @@ func replaceBinary(newBinary []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolving binary path: %w", err)
 	}
-
-	tmpPath := execPath + ".update"
-	if err := os.WriteFile(tmpPath, newBinary, 0755); err != nil {
-		return "", fmt.Errorf("writing update: %w", err)
-	}
-	if err := os.Rename(tmpPath, execPath); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("replacing binary: %w", err)
-	}
 	return execPath, nil
 }
 
+// replaceBinaryAt replaces the file at execPath with newBinary. The contents
+// are staged in a sibling file and renamed over the target, so the target
+// path never holds a partially written binary.
+func replaceBinaryAt(execPath string, newBinary []byte) error {
+	tmpPath := execPath + ".update"
+	// #nosec G306 -- the staged file replaces the running executable and must carry the execute bit; it is written beside the existing binary in a location the invoking user already controls
+	if err := os.WriteFile(tmpPath, newBinary, 0755); err != nil {
+		return fmt.Errorf("writing update: %w", err)
+	}
+	if err := os.Rename(tmpPath, execPath); err != nil {
+		// Best-effort removal of the staged file; the rename failure
+		// returned below is the actionable error.
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("replacing binary: %w", err)
+	}
+	return nil
+}
+
 // restartDaemon sends SIGTERM to the running op-forward daemon so launchd
-// respawns it with the updated binary.
-func restartDaemon(binPath string) {
+// respawns it with the updated binary. It reports whether a daemon was
+// signaled, so the caller knows whether to wait for it to come back.
+func restartDaemon(binPath string) bool {
 	pid := findDaemonPID(binPath)
 	if pid == 0 {
 		fmt.Println("No running daemon found. It will pick up the new version on next start.")
-		return
+		return false
 	}
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
 		fmt.Printf("Could not restart daemon (PID %d): %v — restart manually with: launchctl kickstart gui/$(id -u)/com.op-forward.daemon\n", pid, err)
-		return
+		return false
 	}
-	fmt.Printf("Daemon restarted (PID %d terminated, launchd will respawn).\n", pid)
+	fmt.Printf("Daemon stopped (PID %d); waiting for launchd to respawn it...\n", pid)
+	return true
 }
 
 // findDaemonPID locates the running op-forward serve process.
 // Returns 0 if no daemon is found.
 func findDaemonPID(binPath string) int {
+	// #nosec G204 -- fixed pgrep binary name; the pattern is built from binPath, which is the current executable's own symlink-resolved path, and no shell is involved
 	out, err := osexec.Command("pgrep", "-f", binPath+" serve").Output()
 	if err != nil {
 		return 0
@@ -183,7 +257,9 @@ func extractBinaryFromTarGz(r io.Reader) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decompressing update: %w", err)
 	}
-	defer gz.Close()
+	// Closing the gzip reader only releases decompressor state; every read
+	// error that matters is already surfaced by the tar reader below.
+	defer func() { _ = gz.Close() }()
 
 	tr := tar.NewReader(gz)
 	for {

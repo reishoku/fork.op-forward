@@ -1,202 +1,184 @@
 # Architecture
 
-This page maps the parts of op-forward to their source files and explains why
-each piece exists. For deeper coverage of any subsystem, follow the links into
-the rest of the documentation.
+This page describes the components that make up op-forward, how a single `op`
+command travels from a remote machine to the host and back, and why each piece
+exists. For wire-level detail see [protocol.md](protocol.md); for the
+transports see [transport.md](transport.md).
 
-See also: [`transport.md`](transport.md), [`tokens.md`](tokens.md),
-[`security.md`](security.md), [`protocol.md`](protocol.md).
+## The problem
 
-## The problem op-forward solves
+The 1Password CLI (`op`) unlocks through the 1Password desktop application,
+which on macOS means Touch ID. That chain depends on a graphical session, the
+macOS security framework, and a biometric sensor. Inside a headless VM, a
+container, or a remote SSH session none of those exist, so `op` cannot
+authenticate there.
 
-The 1Password CLI (`op`) needs to talk to the local 1Password desktop app to
-unlock the vault — that path is what triggers Touch ID. Inside a remote VM,
-container, or SSH session, the desktop integration is unavailable, so `op`
-commands fail with no biometric chain to walk.
+op-forward keeps `op` where it works, on the host, and makes the remote side
+believe it has a local `op`. A small daemon on the host executes commands on
+behalf of remote callers; a shim on the remote side intercepts every `op`
+invocation and forwards it. Each forwarded command is executed by the real `op`
+on the host, under a pseudo-terminal so that `op` behaves as it does in an
+interactive terminal. Biometric prompting is the 1Password desktop application's
+documented behavior, which op-forward preserves rather than enforces; how often a
+prompt appears is controlled by 1Password's own settings.
 
-op-forward intercepts every `op` invocation on the remote side and runs the
-real `op` command on the host instead, where the desktop app can prompt for
-Touch ID.
+## Components
 
-## Components at a glance
-
-```
-host (macOS, where Touch ID works)            remote (Linux VM)
-─────────────────────────────────────         ─────────────────────────────────
-op-forward serve                              op (the shim from cmd/install.go)
-  ├─ /health                                    └─ exec op-forward proxy -- "$@"
-  ├─ /op/execute  (PTY-spawned op)                    │
-  └─ /token/refresh                                   │ HTTP-over-Unix-socket
-       ▲                                              ▼
-       │                                         op-forward proxy
-       │  ssh -R remote.sock:host.sock ─────────  net.Dial("unix", ...)
-       │                                         http://unix/op/execute
-1Password app + Touch ID
-```
-
-The host runs a long-lived daemon (`op-forward serve`). The remote runs no
-daemon at all — every `op` invocation forks a short-lived `op-forward proxy`
-process that sends one HTTP request and exits.
-
-## Process layout
-
-### Host (macOS)
-
-| Process | Source | Lifetime | Purpose |
+| Component | Where it runs | Entry point | Responsibility |
 |---|---|---|---|
-| `op-forward serve` | [`cmd/serve.go`](../cmd/serve.go) → [`internal/daemon/server.go`](../internal/daemon/server.go) | Long-running (launchd `KeepAlive`) | Accept Unix-socket HTTP requests, run `op` under a PTY, return stdout/stderr/exit |
-| `op` (real binary) | external | Per-request | The actual 1Password CLI; spawned with a fresh pseudo-terminal so each call triggers Touch ID |
-| 1Password desktop | external | Always running | Holds the unlocked vault, surfaces Touch ID prompts |
-| launchd | system | — | Restarts the daemon on crash and after `op-forward update` |
+| Shim | Remote machine | script written by `op-forward install` ([cmd/install.go](../cmd/install.go)) | Appears on `PATH` as `op`; delegates to `op-forward proxy`; falls back to the real `op` when the proxy reports an infrastructure failure |
+| Proxy | Remote machine | `op-forward proxy` ([cmd/proxy.go](../cmd/proxy.go)) | Resolves the endpoint, probes the daemon, authenticates, refreshes tokens, relays output and exit status |
+| Daemon | Host | `op-forward serve` ([cmd/serve.go](../cmd/serve.go), [internal/daemon/server.go](../internal/daemon/server.go)) | HTTP server exposing `/health`, `/op/execute`, `/token/refresh`; owns the in-memory token pair |
+| Executor | Host (inside the daemon) | [internal/executor/op.go](../internal/executor/op.go) | Validates a request, runs `op` under a pseudo-terminal, captures output and exit status |
+| Endpoint | Both sides | [internal/endpoint/](../internal/endpoint) | Parses `tcp://` and `unix://` endpoints, applies bind rules, performs the peer-uid lookup, builds HTTP clients |
+| Auth | Both sides | [internal/auth/token.go](../internal/auth/token.go) | Token generation, on-disk format, file locations, legacy migration |
+| Version | Daemon | [internal/version/compare.go](../internal/version/compare.go) | Compares client and server versions to produce update hints and the upgrade-required response |
 
-### Remote (VM)
-
-| Process | Source | Lifetime | Purpose |
-|---|---|---|---|
-| `op` (the shim) | [`cmd/install.go`](../cmd/install.go) | Per invocation | Bash wrapper at `~/.local/bin/op` that delegates to `op-forward proxy` |
-| `op-forward proxy` | [`cmd/proxy.go`](../cmd/proxy.go) | Per invocation | Reads tokens, dials the host socket via SSH-forwarded path, sends one HTTP request, relays output and exit code |
-| sshd | external | Long-running | Hosts the `RemoteForward`-mapped Unix socket from the host |
-
-The shim is a bash script so it can fall back to a real `op` binary if the
-proxy infrastructure is unavailable. See [`cli.md` § install](cli.md#install).
+The same `op-forward` binary provides every component. `serve` runs on the host
+and `proxy` runs on the remote side; `install`, `service`, `update`, and
+`version` are management commands. The full list is in [cli.md](cli.md).
 
 ## Request flow
 
-A typical `op item get <uuid>` from inside a VM:
+```
+remote machine                                     host
+--------------                                     ----
+ op item get x
+   |
+   v
+ shim (~/.local/bin/op)
+   |  exec: op-forward proxy -- item get x
+   v
+ proxy
+   | 1. resolve endpoint, read tokens
+   | 2. probe the endpoint (500 ms by default)
+   | 3. POST /op/execute  ---- SSH tunnel or ---->  daemon
+   |    Authorization: Bearer <access token>        | peer-uid check (Unix only)
+   |    X-Client-Version: <version>                 | bearer check
+   |                                                | version check
+   |                                                | argument validation
+   |                                                v
+   |                                              executor
+   |                                                | op item get x   (under a PTY)
+   |                                                v
+   |                                              1Password desktop app: Touch ID
+   |  <---- 200 {"stdout","stderr","exit_code"} ----+
+   v
+ proxy writes stdout/stderr, exits with exit_code
+   |
+   v
+ shim exits with the same status
+```
 
-1. The shell resolves `op` to `~/.local/bin/op` (the shim).
-2. The shim execs `op-forward proxy -- item get <uuid>`.
-3. The proxy resolves the socket path with `transport.SocketPath()` (see
-   [`configuration.md` § Socket path](configuration.md#socket-path)).
-4. The proxy probes the socket with `net.DialTimeout("unix", ...)` (timeout =
-   `OP_FORWARD_PROBE_TIMEOUT_MS`, default `500`). On failure it exits **127**
-   so the shim can fall back to the real `op` binary.
-5. The proxy reads `access.token` (or `session.token` as fallback). If the
-   on-disk expiry is in the past, it skips straight to step 9.
-6. The proxy POSTs to `http://unix/op/execute` with `Authorization: Bearer
-   <access>`, `X-Client-Version: <version>`, body `{"args":[…],"timeout_ms":…}`.
-   The HTTP transport's `DialContext` is rebound to dial the Unix socket
-   (see [`transport.md` § HTTP-over-Unix client](transport.md#http-over-unix-client)).
-7. SSH `RemoteForward` shuttles the bytes from the VM-side socket inode to the
-   host-side socket inode.
-8. The daemon's `ConnContext` extracts the peer UID via `SO_PEERCRED` (Linux)
-   or `LOCAL_PEERCRED` (macOS); a UID mismatch returns `403 Forbidden`. The
-   handler then verifies the Bearer token in constant time. If it matches the
-   access token and is unexpired, execution proceeds.
-9. On `401`, the proxy re-reads `refresh.token` and POSTs to `/token/refresh`.
-   On `200`, it persists both new tokens to disk and retries `/op/execute`
-   once. On non-`200`, it prints an actionable error and exits **127**.
-10. The daemon validates the request body (max args, max arg length, blocked
-    subcommands, shell metacharacters — see
-    [`security.md` § Argument validation](security.md#5-argument-validation)),
-    then `pty.Start`s `op` with a fresh PTY so 1Password sees an interactive
-    session and prompts Touch ID.
-11. The user approves on the host. The daemon collects PTY output, returns
-    `{"stdout":…,"stderr":"","exit_code":…}`. The proxy prints `stdout` and
-    exits with `exit_code`.
+Step by step:
 
-The Touch ID prompt is the one piece of this flow that is *not* automated. It
-is the entire point of the design — every privileged `op` operation triggers a
-fresh biometric prompt because the daemon allocates a new PTY for every call.
-See [`security.md` § Touch ID per call](security.md#6-touch-id-per-call).
+1. The user, or a script, runs `op ...`. The shim script found first on `PATH`
+   runs `op-forward proxy -- <args>`.
+2. The proxy resolves the endpoint from flags and the environment (see
+   [configuration.md](configuration.md#precedence-rules)), then reads the access
+   token. If the access token is missing or expired it uses the refresh token
+   instead (see [tokens.md](tokens.md#client-request-flow)).
+3. The proxy probes the endpoint with a short connection attempt. If nothing
+   accepts the connection, it exits with status 127 without sending a request.
+4. The proxy sends `POST /op/execute` with the arguments and a timeout. On a 401
+   it calls `POST /token/refresh`, stores the new tokens, and retries once.
+5. The daemon applies its checks in a fixed order, described in
+   [protocol.md](protocol.md#execute-endpoint), and hands valid requests to the
+   executor.
+6. The executor starts the host's `op` under a pseudo-terminal, collects the
+   output, and returns it with the exit status.
+7. The proxy prints the output and exits with `op`'s status. Status 127 is
+   reserved for infrastructure failures; when the shim sees it, it executes the
+   real `op` instead (see [protocol.md](protocol.md#exit-codes)).
 
-## Where each subsystem lives
+## Process layout
 
-### `cmd/`
-Subcommand routing and per-command logic. `cmd/root.go` does the dispatch.
+### Host
 
-- [`cmd/serve.go`](../cmd/serve.go) — startup. Migrates legacy `session.token`,
-  loads or generates the refresh token, mints a fresh access token on every
-  start, resolves the socket path, then calls `daemon.New(...).Start()`.
-- [`cmd/install.go`](../cmd/install.go) — writes the bash shim to
-  `~/.local/bin/op`. The shim's `REAL_OP` fallback is the first `op` on `$PATH`
-  that is not the shim's own directory; if none exists, falls back to
-  `/usr/bin/op`.
-- [`cmd/proxy.go`](../cmd/proxy.go) — the per-invocation client. Implements
-  the access/refresh dance described in [`tokens.md`](tokens.md).
-- [`cmd/service.go`](../cmd/service.go) — installs/uninstalls the launchd
-  LaunchAgent (`com.op-forward.daemon`). macOS only; errors on other platforms.
-- [`cmd/update.go`](../cmd/update.go) — fetches the latest GitHub release,
-  atomically replaces the running binary, then `SIGTERM`s the daemon so
-  launchd respawns it with the new code.
+On the host, one long-lived process, `op-forward serve`, listens on the
+configured endpoint. On macOS it is normally supervised by launchd through the
+LaunchAgent that `op-forward service install` writes (see
+[deployment.md](deployment.md#launchd-service)). The daemon executes `op` as the
+user that runs the daemon, so the daemon must run as the user whose
+1Password desktop application should approve the request. The launchd
+integration installs a per-user LaunchAgent for that reason.
 
-### `internal/auth/`
-Token model and persistence. See [`tokens.md`](tokens.md) for the full story.
+State on the host is limited to the token files described in
+[tokens.md](tokens.md#file-locations-and-precedence) and, for Unix endpoints, the
+socket file. The daemon keeps one access token and one refresh token in memory.
 
-- 32-byte random tokens, stored as 64 hex chars.
-- Two TTLs: `AccessTokenTTL = 1h`, `RefreshTokenTTL = 30d`.
-- Persistence uses `os.OpenRoot` + `Root.WriteFile`/`Root.Rename`, constraining
-  all token I/O to the resolved token directory even in the presence of
-  symlinks or `..` components (CWE-22 mitigation).
+### Remote
 
-### `internal/daemon/`
-HTTP server. Three handlers:
+On the remote machine there is no long-lived process. The shim and proxy are
+short-lived: each `op` invocation starts a shell script, which starts
+`op-forward proxy`, which opens a connection, exchanges one request (plus one
+refresh when needed), and exits. State on the remote side consists of the shim
+file, the `op-forward` binary, and the token files.
 
-- `GET  /health`         — unauthenticated liveness check.
-- `POST /op/execute`     — peer-UID-checked, access-token-authenticated.
-- `POST /token/refresh`  — refresh-token-authenticated, returns a rotated pair.
+## Package map
 
-See [`protocol.md`](protocol.md) for the wire format.
+| Path | Contents |
+|---|---|
+| [main.go](../main.go) | Calls `cmd.Execute` and prints any returned error |
+| [cmd/](../cmd) | Subcommand implementations: `root.go` (dispatch and usage), `serve.go`, `install.go`, `proxy.go`, `service.go`, `update.go`, and `config.go` (flag and environment precedence) |
+| [internal/auth/](../internal/auth) | Token type, TTL constants, file helpers, `LoadOrGenerateRefresh`, `MigrateLegacyToken` |
+| [internal/daemon/](../internal/daemon) | HTTP server, route table, peer-uid middleware, token refresh handler, log redaction |
+| [internal/endpoint/](../internal/endpoint) | Endpoint parsing, listen rules, probe, HTTP client, peer credentials per platform |
+| [internal/executor/](../internal/executor) | Request validation, blocked subcommands, PTY execution for macOS and Linux |
+| [internal/version/](../internal/version) | Version parsing and compatibility evaluation |
 
-The server uses a `ConnContext` hook to attach the peer UID to each request's
-context; handlers read it back via the unexported `peerUIDKey{}` type. This
-avoids per-handler syscalls.
+## Why each piece exists
 
-### `internal/transport/`
-Socket path resolution and platform-specific peer-credential extraction.
+**A daemon on the host.** Touch ID is only available where the 1Password desktop
+application runs. Executing `op` on the host is the only way to reach it, and a
+resident process avoids paying a startup cost per command.
 
-- [`socket.go`](../internal/transport/socket.go) — `SocketPath()` precedence
-  and absolute-path validation.
-- [`peercred_linux.go`](../internal/transport/peercred_linux.go) — `SO_PEERCRED`.
-- [`peercred_darwin.go`](../internal/transport/peercred_darwin.go) — `LOCAL_PEERCRED`.
-- [`peercred_other.go`](../internal/transport/peercred_other.go) — fallback
-  returning `-1`. The daemon treats `< 0` as "skip the check"; on platforms
-  without peer-cred support the bearer token is the only authentication.
+**A shim named `op`.** Scripts and tools inside the VM call `op` by name. Placing
+a shim earlier on `PATH` makes forwarding transparent: no script needs to know
+that op-forward exists.
 
-### `internal/executor/`
-- [`op.go`](../internal/executor/op.go) — request validation and PTY-based
-  execution. `MaxArgs = 64`, `MaxArgLength = 4096`, `DefaultTimeout = 60s`,
-  `MaxTimeout = 5m`.
-- [`pty_darwin.go`](../internal/executor/pty_darwin.go),
-  [`pty_linux.go`](../internal/executor/pty_linux.go) — `Setsid + Setctty +
-  Ctty=0` so the spawned `op` becomes its own session leader, plus an `OPOST`
-  clear so the line discipline does not rewrite `\n` to `\r\n` and corrupt the
-  output.
+**A proxy subcommand instead of shell logic.** JSON encoding, HTTP, token
+refresh, and exit-code handling are done in Go, not in the shim script. The shim
+only decides between "use the proxy's result" and "fall back".
 
-### `internal/version/`
-Semantic version comparison and the `CheckCompatibility` function the daemon
-uses to decide whether to set `X-Update-Available` or return `426 Upgrade
-Required`. See [`protocol.md` § Version negotiation](protocol.md#version-negotiation).
+**A fallback to the real `op`.** If the tunnel is down or tokens are missing, the
+proxy exits with 127 and the shim runs the real `op` recorded at install time.
+Machines that also have a working local `op` keep working when the tunnel drops.
 
-## Why this shape
+**Two transports behind one endpoint type.** SSH port forwarding and Docker
+Desktop's `host.docker.internal` route both terminate on loopback TCP. Unix
+domain sockets give a kernel-permissioned endpoint that avoids port collisions
+between VMs. The endpoint package hides the difference so the HTTP, token, and
+JSON layers are identical for both. This fork defaults to the Unix socket on
+both sides and uses TCP only when it is asked for, because the socket is the
+endpoint the kernel can restrict to one user. See [transport.md](transport.md).
 
-A few decisions that may not be obvious from the code:
+**Bearer tokens in addition to the transport.** Loopback TCP is reachable by any
+local process, and a forwarded port is reachable by any user on the VM.
+Authentication therefore does not rely on the transport alone. See
+[security.md](security.md#3-bearer-tokens).
 
-- **Per-call subprocess on the remote.** Running a long-lived agent on the VM
-  would mean another moving part to keep alive across SSH disconnects and
-  another place to leak tokens. The shim+proxy pattern is stateless on the
-  remote.
-- **HTTP over a Unix socket, not a custom protocol.** Using `net/http` keeps
-  framing, timeouts, status codes, and observability for free. The socket file
-  with `0600` permissions is the access boundary; HTTP is just the wire format.
-- **PTY allocation per call.** 1Password caches a single biometric approval
-  for non-interactive `op` calls. Allocating a fresh pseudo-terminal makes
-  every call look interactive, so Touch ID prompts every time. See the
-  comment block in [`internal/executor/op.go`](../internal/executor/op.go).
-- **Two-tier tokens.** A short-lived access token limits exposure if it leaks;
-  a long-lived sliding refresh token avoids forcing daily redeploys. See
-  [`tokens.md`](tokens.md) for the trade-offs.
-- **Bash shim, not a Go binary at `op`.** The shim needs to be unconditionally
-  exec-able on the user's PATH and able to fall back when the proxy itself is
-  broken — bash is the simplest dependency that already exists on every VM.
+**Two token tiers.** A short-lived access token limits how long a leaked
+credential is useful, and a longer-lived refresh token lets clients recover from
+daemon restarts without a manual redeploy. See [tokens.md](tokens.md).
 
-## Cross-references
+**A pseudo-terminal for `op`.** The executor runs `op` with a full PTY so that it
+behaves as in an interactive terminal on all three standard streams. The
+consequences are that stdout and stderr arrive merged and that `op` may emit ANSI
+color escapes; see [protocol.md](protocol.md#output-formatting).
 
-- Wire protocol: [`protocol.md`](protocol.md)
-- Transport details: [`transport.md`](transport.md)
-- Token model: [`tokens.md`](tokens.md)
-- Threat model: [`security.md`](security.md)
-- CLI reference: [`cli.md`](cli.md)
-- Configuration: [`configuration.md`](configuration.md)
-- Deployment: [`deployment.md`](deployment.md)
-- Build & release: [`development.md`](development.md)
+**Argument validation and a subcommand blocklist.** The daemon accepts
+arguments from a network peer, so it restricts what it will pass to `op`. See
+[security.md](security.md#5-argument-validation).
+
+**Version negotiation.** The daemon can tell clients that an update exists and
+can refuse clients older than a configured minimum. See
+[protocol.md](protocol.md#version-negotiation).
+
+## See also
+
+- [transport.md](transport.md) for endpoints and tunnels
+- [tokens.md](tokens.md) for the authentication lifecycle
+- [protocol.md](protocol.md) for the HTTP API
+- [security.md](security.md) for the threat model
+- [development.md](development.md) for building and releasing

@@ -1,257 +1,220 @@
 # Security model
 
-This page documents the threat model, the layers of defence, and what the
-project explicitly does **not** protect against. The supporting reference
-material is in [`transport.md`](transport.md), [`tokens.md`](tokens.md), and
-[`protocol.md`](protocol.md).
+This page describes what op-forward is designed to protect, the layers it
+applies, and what falls outside its protection. Behavior is described as the
+code implements it today. The source for most of the checks is
+[internal/daemon/server.go](../internal/daemon/server.go),
+[internal/executor/op.go](../internal/executor/op.go), and
+[internal/endpoint/](../internal/endpoint).
 
 ## Threat model
 
-op-forward assumes:
+op-forward gives processes on a remote machine the ability to run `op` on the
+host, as the host user, with the host's 1Password session. The assets at stake
+are the secrets that `op` can read or change and any side effects `op` can have
+on the host.
 
-- The host machine (running `op-forward serve`) is trusted. If the host is
-  compromised, all bets are off — the attacker can already run `op` directly
-  with full Touch ID approval.
-- The remote machine (the VM) is *less* trusted. The design tolerates a
-  mildly compromised remote: token disclosure must not give the attacker
-  more than the user already has, and Touch ID must remain the gate for
-  every privileged operation.
-- The SSH tunnel between the two is secure. SSH key management,
-  `known_hosts`, and host-key verification are out of scope.
-- Clock skew between host and VM is bounded enough that token expiry checks
-  (which are time-based) are not subverted in practice.
+| Actor | Assumed trust | Considered by the design |
+|---|---|---|
+| Host operating system and the host user's own processes | Trusted | No. A process running as the host user can read the token files and talk to the daemon directly |
+| 1Password desktop application and Touch ID | Trusted; the primary authorization boundary | Yes, as the gate on privileged operations |
+| Other user accounts on the host | Untrusted | Yes: loopback binding, socket permissions, peer uid check, bearer token |
+| Network peers of the host | Untrusted | Yes: TCP binds are loopback only |
+| Remote machine (VM or container) | Partly trusted: it is allowed to ask, not to bypass approval | Yes: token authentication, argument validation, blocklist, Touch ID |
+| Other users on the remote machine | Untrusted | Partly: token files are mode 0600 and a Unix socket's mode is set by sshd; a forwarded TCP port is open to every user on the VM |
+| The SSH connection | Trusted for confidentiality | No separate encryption: the HTTP traffic is plain and relies on the tunnel |
 
-The primary security boundary is **Touch ID**: every privileged 1Password
-operation triggers a fresh biometric prompt on the host. The proxy cannot
-bypass this — Touch ID is enforced by the 1Password desktop app, not by
-op-forward itself. op-forward is responsible for *not undermining* the
-biometric gate.
+## Defense layers
 
-## Layers of defence
+### 1. Loopback-only binding
 
-The defences below are listed in order of how a request hits them.
+TCP endpoints must have a loopback IP literal as the host (127.0.0.0/8 or
+`::1`); anything else, including `localhost` and `0.0.0.0`, is refused at
+startup. The daemon has no option to listen on another interface. See
+[transport.md](transport.md#tcp-endpoints).
 
-### 1. Filesystem socket permissions
+Unix socket endpoints must live in a directory owned by the daemon's user with
+no group or other permission bits. The socket is created with mode 0600
+(umask 0177 at creation, followed by an explicit `chmod`). A non-socket file at
+the path is never replaced. A socket that answers a probe connection is treated as
+live and is never taken over; one whose probe fails for any reason, including a
+timeout or a permission error, is treated as stale and removed. See
+[transport.md](transport.md#unix-socket-endpoints).
 
-The daemon's listening socket is a `0600` inode under a `0700` directory. A
-process running as a different UID on the same host cannot `connect()` to
-the socket — the kernel returns `EACCES` before any byte flows. Details and
-implementation in [`transport.md` § Filesystem permissions](transport.md#filesystem-permissions).
+### 2. Peer credential check
 
-### 2. Peer-credential check
+On Unix connections the daemon reads the connecting process's uid from the
+kernel (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS) and answers
+`403 forbidden` if it differs from the daemon's own uid. The check wraps every
+route, including `/health` and `/token/refresh`. It does not apply to TCP, and
+it does not distinguish between users on a VM behind an `ssh -R` forward, because
+the connecting process on the host is always the `ssh` client. See
+[transport.md](transport.md#what-the-check-can-and-cannot-see).
 
-After the kernel allows the connection, the daemon reads the peer's UID via
-`SO_PEERCRED` (Linux) or `LOCAL_PEERCRED` (macOS) and refuses anything but
-its own UID with `403 Forbidden`. Implementation:
-[`internal/transport/peercred_*.go`](../internal/transport/) and
-[`server.go` `handleExecute`](../internal/daemon/server.go).
+### 3. Bearer tokens
 
-This is redundant with the filesystem-mode check above on Linux/macOS — but
-not on platforms where peer credentials are unavailable, where the FS check
-is the only same-host barrier. Defence in depth.
+`/op/execute` requires a valid, unexpired access token and `/token/refresh`
+requires the current refresh token. Tokens are 32 random bytes, compared in
+constant time, stored in files with mode 0600 in a directory created with mode
+0700, and rotated on refresh. Access tokens last one hour and refresh tokens 30
+days. The daemon accepts only its single in-memory pair. See
+[tokens.md](tokens.md).
 
-#### Why `/token/refresh` skips the UID check
-
-Only `/op/execute` enforces the peer-UID match. `/health` is unauthenticated
-on purpose and `/token/refresh` is gated by the refresh token, which is itself
-a secret. A same-host adversary who somehow held a valid refresh token would
-already have escaped the FS-mode boundary. Adding a UID check there would
-not increase the bar — it would only make recovery from a forwarded-tunnel
-configuration error harder.
-
-If you need to lock `/token/refresh` to the local UID as well, that is a
-single-line change in `handleTokenRefresh`. Reach out before doing so; you
-will also break the SSH-forwarded refresh path that works today.
-
-### 3. Bearer-token authentication
-
-The `Authorization: Bearer <token>` header is required for `/op/execute`
-(access token) and `/token/refresh` (refresh token). Tokens are 32 random
-bytes (64 hex chars) from `crypto/rand`. Comparison uses `hmac.Equal` for
-constant-time equality, which closes the timing side-channel that a naïve
-string `==` would leave.
-
-Token files are mode `0600` and writes go through `os.OpenRoot` (Go's
-traversal-resistant API) so a tampered symlink cannot redirect token I/O
-outside the configured directory. Full details in [`tokens.md`](tokens.md).
+There is no limit on authentication attempts and no lockout. The 256-bit token
+space is the protection against guessing.
 
 ### 4. No shell execution
 
-`op` is launched via `exec.CommandContext(ctx, opPath, req.Args...)` — direct
-`execve(2)`, not via `/bin/sh -c`. There is no shell to inject into.
-Argument quoting, glob expansion, command substitution, redirection, `$IFS`
-tricks — none apply. Source: [`internal/executor/op.go`](../internal/executor/op.go).
+The executor runs `op` directly with `exec.Command(opPath, args...)`. Arguments
+are passed as an argument vector, never interpreted by a shell. The path to `op`
+is found with `exec.LookPath("op")` in the daemon's environment; under the
+launchd service the `PATH` is
+`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 
 ### 5. Argument validation
 
-Even though shell injection is structurally impossible, the executor still
-rejects suspicious arguments early:
+`Request.Validate` rejects a request when:
 
-- **Empty args** → error.
-- **More than `MaxArgs` (64)** → error.
-- **Argument longer than `MaxArgLength` (4096) bytes** → error.
-- **Disallowed character set**: any `\``, `$`, `|`, `;`, `&`, `\n`, `\r` in
-  any argument fails validation. The `op` CLI uses structured arguments;
-  none of these characters appear in legitimate inputs (UUIDs, paths under
-  `op://`, item names, vault names, `--flag=value` forms, addresses).
+- there are no arguments, or more than 64;
+- any argument is longer than 4096 bytes;
+- any argument contains a backtick, `$`, `|`, `;`, `&`, a newline, or a carriage
+  return;
+- the first argument is a blocked subcommand (next section).
 
-Test coverage: [`internal/executor/op_test.go`](../internal/executor/op_test.go).
-The "legitimate args" table there is the canonical list of patterns we
-guarantee to *not* reject.
+A rejected request is answered with HTTP 200, `exit_code` 1, and the reason in
+`stderr` (see [protocol.md](protocol.md#execute-response)). Because no shell is
+involved, the metacharacter rule is a conservative extra layer. Its practical
+effect is that arguments which legitimately contain those characters, such as an
+item field value with `$` or `&`, cannot be sent through the proxy.
 
-### Blocked subcommands
+### 6. Blocked subcommands
 
-Four `op` subcommands are refused regardless of arguments:
+| Subcommand | Reason recorded in the source |
+|---|---|
+| `signin` | Interactive authentication must happen locally |
+| `signout` | Would sign out the host's session |
+| `update` | Would update the host's `op` binary |
+| `completion` | Shell completion is not useful over the proxy |
 
-| Subcommand   | Why blocked |
-|--------------|-------------|
-| `signin`     | Interactive authentication — must happen on the host with a real terminal. |
-| `signout`    | Would clear the host's session that everyone else is sharing. |
-| `update`     | Would update the host's `op` binary; out of band of op-forward releases. |
-| `completion` | Shell completion script — pointless to forward. |
+The comparison is made against the first argument only. An invocation whose
+first argument is something else, such as a global flag, is compared as that
+argument. All other subcommands are forwarded, including those that change
+1Password data and those that execute programs or write files on the host (for
+example `op run` and options that write to a file path).
 
-A blocked subcommand returns HTTP `200` with `exit_code = 1` and an
-explanatory `stderr`, not `400`/`403`, because that is what `op` itself does
-for argument errors and we want the contract uniform from the proxy's
-perspective. Source: `executor.Request.Validate` in
-[`internal/executor/op.go`](../internal/executor/op.go).
+### 7. Audit logging and redaction
 
-### Audit logging with redaction
+Before executing, the daemon logs one line through Go's `log` package, with a
+timestamp:
 
-The daemon logs every executed request through `log.Printf("[op-forward]
-executing: op %s", sanitizeArgsForLog(args))`. `sanitizeArgsForLog`:
+```
+[op-forward] executing: op <arguments>
+```
 
-- Redacts the value following `--password` or `-p` (the next argument is
-  replaced with `[REDACTED]`).
-- Does **not** redact `--reveal` itself (it is a flag, not a value-bearing
-  option).
+Rejected requests are logged too, because the line is written before validation.
+Other log lines record executor errors, refused peer uids
+(`refused connection from uid N (daemon runs as uid M)`), and token refreshes
+(with expiry times, never token values). Output from `op` is not logged, and the
+log does not record which client sent the request.
 
-The token in `Authorization` is never logged. The audit line goes to the
-launchd `StandardOutPath` / `StandardErrorPath` — by default
+Redaction replaces the argument that follows `--password` or `-p` with
+`[REDACTED]`. Other forms are logged as given, including `--password=value`, and
+assignment-style arguments such as `field=value` that carry secrets.
+`--reveal` is printed as is. Treat the log as sensitive when commands that carry
+secrets in their arguments are forwarded.
+
+Under the launchd service, standard output and standard error go to
 `~/Library/Logs/op-forward.log`.
 
-Test coverage: `TestSanitizeArgsForLog` in
-[`internal/daemon/server_test.go`](../internal/daemon/server_test.go).
+### 8. Biometric approval per call
 
-### 6. Touch ID per call
+Biometric approval is behavior of the 1Password desktop application and `op`,
+not something op-forward enforces. The executor runs `op` under a pseudo-terminal
+so that it sees an interactive session on all three standard streams, which
+preserves the prompting behavior 1Password documents for a terminal session; the
+executor's design note records that without a terminal, 1Password may reuse an
+earlier approval and skip the prompt. This is the primary authorization boundary:
+the daemon cannot approve a request on the user's behalf. How often a prompt
+appears is controlled by the 1Password application's own settings, which
+op-forward does not control or verify.
 
-Without intervention, the 1Password CLI caches its biometric approval and
-skips Touch ID for follow-up calls within the same session. op-forward
-defeats that caching by allocating a *new* pseudo-terminal for every `op`
-invocation:
+### 9. Resource limits
 
-- `cmd.SysProcAttr` sets `Setsid + Setctty + Ctty=0` so the spawned `op`
-  becomes its own session leader.
-- `pty.Start(cmd)` opens a fresh PTY pair and wires stdin/stdout/stderr to
-  the slave.
-- The `op` process therefore sees an interactive terminal on every fd, which
-  is the heuristic 1Password uses to decide "this is a fresh session, prompt
-  again".
+| Limit | Value |
+|---|---|
+| Request body | 1 MiB |
+| Arguments per request | 64 |
+| Bytes per argument | 4096 |
+| Execution timeout | 60 s default, 300 s maximum |
+| Server read / write / idle timeouts | 30 s / 310 s / 120 s |
 
-Implementation: [`internal/executor/op.go`](../internal/executor/op.go),
-[`internal/executor/pty_*.go`](../internal/executor).
+There is no cap on concurrent requests and no rate limiting.
 
-This is the mechanism that turns Touch ID into the *primary* security
-boundary: even an attacker holding a current access token cannot smuggle
-through more than one operation per biometric prompt.
+### 10. Version negotiation
 
-### 7. Path traversal resistance
+The daemon can reject clients older than `MinClientVersion` with `426`. The check
+runs only when the client sends `X-Client-Version`, so it is advisory and not an
+access control. See [protocol.md](protocol.md#version-negotiation).
 
-Token persistence uses `os.OpenRoot(dir)` plus `Root.WriteFile`,
-`Root.ReadFile`, and `Root.Rename`. These APIs are documented to resist
-symlink traversal and `..` traversal even when the target directory contains
-hostile content. The basename is also checked with `filepath.IsLocal` before
-the call. Source: `auth.SaveToPath` and `auth.LoadFromPath` in
-[`internal/auth/token.go`](../internal/auth/token.go).
+## What is not protected
 
-Socket paths are validated with `filepath.Clean` and `filepath.IsAbs` —
-relative paths are rejected.
-
-### 8. Resource limits
-
-| Limit                          | Value          | Where set |
-|--------------------------------|----------------|-----------|
-| HTTP request body              | 1 MiB          | `http.MaxBytesReader` in `handleExecute` |
-| Read timeout (request line + headers + body) | 30s | `http.Server.ReadTimeout` in `Server.Start` |
-| Write timeout                  | 5m 10s         | `http.Server.WriteTimeout` in `Server.Start` |
-| Idle (keep-alive) timeout      | 2m             | `http.Server.IdleTimeout` in `Server.Start` |
-| Per-`op`-call execution timeout (default) | 60s | `executor.DefaultTimeout` |
-| Per-`op`-call execution timeout (max)     | 5m  | `executor.MaxTimeout` (clamps client-supplied values) |
-| Argument count                 | 64             | `executor.MaxArgs` |
-| Argument byte length           | 4096           | `executor.MaxArgLength` |
-| Probe timeout (proxy → daemon) | 500ms (override `OP_FORWARD_PROBE_TIMEOUT_MS`) | `cmd/proxy.go` |
-| Fetch timeout (proxy HTTP)     | 60000ms (override `OP_FORWARD_FETCH_TIMEOUT_MS`) | `cmd/proxy.go` |
-
-These are not security guarantees against a determined denial-of-service —
-the same-UID assumption already covers that — but they put bounds on the
-worst case under buggy clients or stuck `op` calls.
-
-### 9. Version negotiation
-
-The daemon advertises its version and refuses clients below `MinClientVersion`
-(default `0.1.0`, currently). Bump it when shipping a release that fixes a
-client-side security bug or changes the wire protocol in a way that older
-clients would silently misuse. See [`protocol.md` § Version negotiation](protocol.md#version-negotiation).
-
-The current default is permissive on purpose; it is here as a kill switch for
-a future security release.
-
-## What this does NOT protect against
-
-- **Compromised VM with a token.** An attacker on the VM who holds a current
-  access token can run any non-blocked `op` command — subject to a Touch ID
-  prompt on the host. The user must approve. If the user habitually approves
-  every prompt without reading, the prompt's value is reduced.
-- **Compromised host.** If the host is compromised the attacker can run `op`
-  directly. op-forward adds nothing in that scenario.
-- **Touch ID misconfiguration.** If 1Password is configured to *not* require
-  biometric approval for every `op` invocation (uncommon but possible), the
-  daemon will execute requests without any biometric gate. op-forward does
-  not enforce 1Password's policy; it only ensures the CLI sees an interactive
-  TTY so the policy can fire.
-- **SSH tunnel hijack.** If an attacker has the SSH credentials they have
-  the tunnel; the bearer token plus peer-cred checks become moot. Use
-  hardware-backed SSH keys.
-- **Side-channel inference of secrets via `op` output.** The proxy returns
-  whatever `op` writes to its PTY. If a downstream tool logs that output, it
-  may end up in places you did not intend. Configure your shell history and
-  log rotation accordingly.
-- **Detection-evasion.** Audit logs go to disk on the host, but op-forward
-  does not have a centralized telemetry sink. Add one if your environment
-  needs it.
+- **A holder of valid tokens.** Anyone who can read the token files on a remote
+  machine, or who can open the daemon's endpoint and present a token, can ask the
+  daemon to run any non-blocked `op` subcommand as the host user. Touch ID is the
+  remaining control.
+- **Touch ID configuration.** If 1Password is configured so that `op` does not
+  require approval for every invocation, forwarded commands run without a
+  per-command prompt.
+- **Unblocked subcommands.** The blocklist is short, matches the first argument
+  only, and is not a policy engine. Write operations and subcommands that execute
+  programs or write files are forwarded.
+- **TCP peers on the host.** TCP connections carry no peer identity. Any local
+  process that can reach the port is held back only by the bearer token.
+- **Users on the VM.** A forwarded TCP port on the VM is open to every VM user;
+  separation relies on token file permissions.
+- **Transport confidentiality.** Requests, tokens, and output travel as plain
+  HTTP. Over a tunnel or loopback this is as safe as the tunnel. The proxy sends
+  its tokens to whatever endpoint it is configured with, with no certificate or
+  host verification, so pointing `OP_FORWARD_ADDR` or `OP_FORWARD_HOST` at an
+  untrusted host discloses them.
+- **Secrets in arguments and output.** Arguments are logged with the limited
+  redaction above, and `op` output (which can contain secrets) is returned to the
+  caller, and may be shown or stored wherever the caller sends it.
+- **Standard input.** It is not forwarded, so it is neither an exposure nor a
+  capability.
+- **Binary integrity.** `op-forward update` and `scripts/install.sh` download
+  release archives over HTTPS from GitHub; neither verifies a separate checksum
+  or signature. The package repositories are signed in different ways: RPM and
+  Alpine packages carry per-package signatures (and the RPM and Alpine
+  repository metadata is signed), while for APT the `Release` and `InRelease`
+  files are signed and the individual `.deb` files are not. See
+  [development.md](development.md#package-repositories).
+- **Compromise of the host or the host user.** Out of scope.
+- **Revocation without restart.** The daemon has no revocation call; see
+  [tokens.md](tokens.md#revoking-access).
 
 ## Hardening checklist
 
-Reasonable opt-in steps for production-ish deployments:
-
-- [ ] 1Password set to require biometric approval per CLI invocation.
-- [ ] Host token directory on a filesystem with `noexec,nosuid` if it is
-  separate from the OS root.
-- [ ] launchd plist not world-readable: the default is `0644`, which is
-  fine in single-user contexts but adjust if multiple users share the
-  machine.
-- [ ] SSH `AllowAgentForwarding no` and `PermitTunnel no` server-wide;
-  RemoteForward does not require those.
-- [ ] On the VM: `chmod 700` of the parent directory of the
-  forwarded-socket path, even though SSH sets it for you in
-  `XDG_RUNTIME_DIR`.
-- [ ] `MinClientVersion` bumped to the current release before each new
-  rollout if the previous release had a client-side bug.
-
-## Security boundaries summary
-
-| Boundary | Enforced by |
-|---|---|
-| Same-host cross-UID isolation | Filesystem socket permissions (kernel) + peer-cred check (op-forward) |
-| Cross-host authentication | SSH (out of scope) + Bearer token (op-forward) |
-| Per-operation authorization | Touch ID (1Password) — assumed |
-| Argument safety | `os/exec` direct exec + argument validation (op-forward) |
-| Long-lived secret hygiene | Two-tier tokens with rotation (op-forward) |
+- Keep the default Unix socket where the topology allows it, so that the kernel
+  enforces who can connect; where TCP is needed (Docker Desktop), it is bound
+  to loopback only.
+- Leave `StreamLocalBindMask` restrictive on VMs that receive a forwarded socket,
+  and set `StreamLocalBindUnlink yes` only for the stale-socket case described in
+  [transport.md](transport.md#forwarding-a-unix-socket).
+- Verify the token directories are mode 0700 on both sides and the files 0600.
+- Deploy only `refresh.token` to a remote machine; the access token is obtained
+  by refresh.
+- Keep 1Password configured to require approval for each `op` invocation.
+- Review `~/Library/Logs/op-forward.log` and restrict who can read it.
+- Follow the procedure in [tokens.md](tokens.md#revoking-access) after removing a
+  machine from the set of trusted clients.
+- Use package-manager updates on Linux hosts, where the repositories are signed
+  (see [What is not protected](#what-is-not-protected) for how).
+- Do not point a client at a host you do not control.
 
 ## See also
 
-- [`transport.md`](transport.md) — wire transport details and CWE mapping
-- [`tokens.md`](tokens.md) — token storage and rotation
-- [`protocol.md`](protocol.md) — HTTP request/response shapes
-- [`internal/executor/op.go`](../internal/executor/op.go) — argument validation
-- [`internal/daemon/server.go`](../internal/daemon/server.go) — handler logic
+- [transport.md](transport.md) for the endpoint and peer checks
+- [tokens.md](tokens.md) for the authentication lifecycle
+- [protocol.md](protocol.md) for status codes and limits
+- [architecture.md](architecture.md) for how the components fit together

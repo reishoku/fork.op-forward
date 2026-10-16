@@ -1,242 +1,313 @@
 # Transport
 
-This page covers the wire transport: how bytes get from the proxy in the VM to
-the daemon on the host. The wire format on top of that transport is HTTP/1.1,
-documented in [`protocol.md`](protocol.md).
+op-forward carries the same HTTP protocol over two transports: loopback TCP and
+Unix domain sockets. A single endpoint value selects the transport for both the
+daemon (what it binds) and the proxy (what it dials). The implementation is in
+[internal/endpoint/](../internal/endpoint), with the parsing in
+[endpoint.go](../internal/endpoint/endpoint.go), the listen rules in
+[transport.go](../internal/endpoint/transport.go), and the environment handling
+in [config.go](../internal/endpoint/config.go).
 
-## Why a Unix domain socket
+## Endpoint syntax
 
-Until PR #1 in this fork, the daemon listened on `127.0.0.1:18340` (loopback
-TCP) and SSH forwarded that port. Loopback TCP has two properties that Unix
-sockets fix:
+An endpoint is a string of one of two forms:
 
-1. **Any local process can `connect()` to a loopback port.** The bearer token
-   was the only thing keeping a co-tenant's process out. With a Unix socket
-   the kernel checks file permissions on `connect()`; a `0600` socket inode
-   under a `0700` directory cannot be opened by any other UID.
-2. **Local TCP carries no kernel-verified peer identity.** Unix sockets expose
-   the peer's UID via `SO_PEERCRED` (Linux) and `LOCAL_PEERCRED` (macOS), so
-   the daemon can refuse same-machine cross-user access even if a token leaks.
+| Form | Example | Notes |
+|---|---|---|
+| `tcp://HOST:PORT` | `tcp://127.0.0.1:18340`, `tcp://[::1]:18340` | Host and port are both required; the port must be numeric; IPv6 literals are bracketed |
+| `unix:///ABSOLUTE/PATH` | `unix:///Users/me/Library/Caches/op-forward/op-forward.sock` | The path must be absolute and non-empty; it is cleaned (`filepath.Clean`) before use |
 
-These map to CWE-200 (information exposure to an unintended actor) and CWE-306
-(missing authentication, defence-in-depth) — see [`security.md`](security.md)
-for the full mapping.
+Anything else is rejected, including a bare `host:port`, an `http://` URL, a
+relative Unix path (`unix://relative/x.sock`), an empty string, and a TCP
+endpoint with a trailing path such as `tcp://127.0.0.1:18340/op`. A malformed
+value fails at startup rather than silently falling back to the default, so a
+typo in an environment variable is visible immediately. The test cases are in
+[endpoint_test.go](../internal/endpoint/endpoint_test.go).
 
-## Socket path resolution
+How an endpoint is chosen from flags and environment variables, including the
+shorthand `OP_FORWARD_HOST` and `OP_FORWARD_PORT`, is covered in
+[configuration.md](configuration.md#precedence-rules).
 
-The proxy and the daemon agree on the socket path through the same resolution
-function: [`transport.SocketPath`](../internal/transport/socket.go).
+## Default endpoint
 
-Precedence, in order:
+When no endpoint and no TCP shorthand is configured, both sides use the Unix
+socket returned by `endpoint.DefaultSocketPath`:
 
-1. `OP_FORWARD_SOCKET_PATH` — used verbatim if set. Must be absolute.
-2. `XDG_RUNTIME_DIR` — if set, the path is `$XDG_RUNTIME_DIR/op-forward.sock`
-   (no `op-forward/` subdirectory). Linux distros that ship systemd typically
-   set this to `/run/user/<uid>` with the right mode and ownership.
-3. `os.UserCacheDir()` — falls through to `<cache>/op-forward/op-forward.sock`.
-   On Linux the cache dir respects `XDG_CACHE_HOME` and otherwise defaults to
-   `~/.cache`. On macOS it is `~/Library/Caches`.
-4. If `os.UserCacheDir()` errors, the resolver tries `~/.cache` directly. If
-   even that yields the empty string, it returns an error and the caller exits.
+1. `OP_FORWARD_SOCKET_PATH`, if set. It must be absolute; a relative value is
+   an error rather than being ignored.
+2. `$XDG_RUNTIME_DIR/op-forward.sock`, if `XDG_RUNTIME_DIR` is an absolute
+   path (the XDG Base Directory Specification says relative values must be
+   ignored).
+3. `op-forward/op-forward.sock` in the OS cache directory (`os.UserCacheDir`):
+   `~/Library/Caches/op-forward/op-forward.sock` on macOS,
+   `$XDG_CACHE_HOME/op-forward/op-forward.sock` or
+   `~/.cache/op-forward/op-forward.sock` on Linux.
 
-Sanitization rules (`sanitizeSocketPath`):
+Each side resolves this in its own environment, so on a VM the forwarded
+socket's path must match what the proxy resolves; setting
+`OP_FORWARD_SOCKET_PATH` there removes the dependence on `XDG_RUNTIME_DIR`,
+which is set in some contexts (typically SSH logins on systemd hosts) and not
+in others.
 
-- Empty → error.
-- Cleaned via `filepath.Clean` (collapses `..`, duplicate slashes).
-- Must be absolute (`filepath.IsAbs`); a relative path errors out.
+## Choosing a transport
 
-The same rules apply on both sides, so as long as the *post-clean* paths match
-between VM and host (after SSH `RemoteForward`), the proxy and daemon agree.
+| Requirement | TCP | Unix socket |
+|---|---|---|
+| SSH `-R` port forwarding | Yes | Not applicable |
+| SSH `-R` socket forwarding | Not applicable | Yes |
+| Docker Desktop containers | Yes, through `host.docker.internal` | No; a host socket cannot be bind-mounted into the container |
+| Several VMs on one host without port collisions | Needs one port per VM | One socket path per VM |
+| Kernel-enforced access control on the endpoint | No | Yes (mode and directory ownership, peer uid) |
+| Default | No (shorthand `tcp://127.0.0.1:18340` when `OP_FORWARD_PORT` / `OP_FORWARD_HOST` / `--port` / `--host` is set) | Yes (see [Default endpoint](#default-endpoint)) |
 
-## Filesystem permissions
+The bearer-token check, the argument validation, and the JSON bodies are
+identical over both transports.
 
-When the daemon starts, [`internal/daemon/server.go`](../internal/daemon/server.go)
-makes the chain of permission checks deterministic:
+## TCP endpoints
 
-1. `os.MkdirAll(filepath.Dir(socketPath), 0o700)` — parent directory `0700`.
-2. `os.Remove(socketPath)` — clears any stale inode left by a previous run.
-3. `net.Listen("unix", socketPath)` — binds.
-4. `os.Chmod(socketPath, 0o600)` — narrows the inode mode.
+The daemon refuses to bind a TCP endpoint unless its host is a loopback IP
+literal. The check is `Endpoint.IsLoopback`:
 
-Net effect: only the owning UID can `open()` the directory or the socket file.
-A different UID's `connect()` fails with `EACCES` before any bytes flow.
+- `127.0.0.1`, any other `127.x.y.z` address, and `::1` are accepted.
+- `0.0.0.0`, `::`, private addresses such as `10.0.0.1`, and names such as
+  `host.docker.internal` are refused.
+- `localhost` is refused too. A name is resolved by whatever the system resolver
+  returns, which can be a routable address, so only IP literals count.
 
-The `0600` step is explicit because `net.Listen` honours the process `umask`
-when creating the inode, and the default `umask` of `022` would otherwise
-yield `0644`. Do not rely on inheriting the directory mode — the kernel does
-not.
+A refused bind fails with `refusing to bind to non-loopback address: ...`. The
+`serve` command has no host option; `OP_FORWARD_HOST` names where a client
+dials and the daemon never reads it. The only way to expose the daemon beyond
+the machine is through a tunnel or Docker Desktop's route, both of which arrive
+on loopback.
 
-## Peer credential enforcement
+Dialing has no such restriction: the proxy accepts any `tcp://host:port`, which
+is how a container reaches `host.docker.internal`.
 
-Even with the filesystem checks above, the daemon verifies the peer's UID on
-every connection. `Server.Start` registers a `ConnContext` hook on the
-`http.Server`:
+TCP connections carry no peer credentials, so the peer-uid check described below
+does not apply to them. Any local process that can open the port still has to
+present a valid bearer token.
 
-```go
-server.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
-    if uc, ok := c.(*net.UnixConn); ok {
-        if uid, err := transport.PeerUID(uc); err == nil && uid >= 0 {
-            ctx = context.WithValue(ctx, peerUIDKey{}, uid)
-        }
-    }
-    return ctx
-}
-```
+## Unix socket endpoints
 
-`PeerUID` is platform-specific:
+`Endpoint.Listen` applies these rules when it binds a `unix://` endpoint.
+
+### Directory requirements
+
+1. The socket's parent directory is created with mode 0700 if it does not exist
+   (`os.MkdirAll`). Only newly created directories receive that mode.
+2. The parent directory must then pass `checkPrivateDir`:
+   - it is a directory;
+   - it has no group or other permission bits (`mode & 0077 == 0`);
+   - it is owned by the uid of the daemon process.
+
+   A shared directory such as `/tmp` fails the check with a message of the form
+   `socket directory /tmp is mode 0777; it must be 0700 so other users cannot
+   reach the socket`.
+
+Only the immediate parent is checked. The check applies on the machine where
+the daemon runs; the VM-side socket created by `ssh -R` is governed by sshd (see
+[Forwarding a Unix socket](#forwarding-a-unix-socket)).
+
+### Socket creation and permissions
+
+The socket is created with the process umask set to 0177, so it exists with mode
+0600 from the first instant instead of being tightened by a later `chmod`. The
+umask is restored immediately after the bind, and the daemon then applies an
+explicit `chmod 0600` as a second step. If the `chmod` fails, the listener is
+closed and the daemon exits with an error.
+
+The effect is that other users on the host cannot connect to the socket at all,
+independent of the bearer token.
+
+### Stale and live sockets
+
+Before binding, the daemon inspects the path with `Lstat`:
+
+| What is at the path | Result |
+|---|---|
+| Nothing | Bind proceeds |
+| A socket whose probe connection fails | The file is removed and the bind proceeds (treated as a "stale socket") |
+| A socket that accepts the probe connection within 200 ms | Refused: `socket PATH is already in use by another daemon` |
+| Anything that is not a socket (regular file, directory, symlink) | Refused: `PATH exists and is not a socket; refusing to replace it`. The file is never modified or removed |
+
+The distinction is made by a single probe, not by proof that nobody is
+listening. Any probe failure leads to removal, whatever its cause: connection
+refused, a timeout, or a permission error all count as "stale". A live listener
+that answers the probe within 200 ms is never removed.
+
+The daemon installs no signal handler, so a SIGTERM from `op-forward update`,
+`launchctl`, or a plain `kill` ends the process without closing the listener
+and leaves the socket file behind. The next start treats it as stale and
+replaces it. Two daemons configured with the same path cannot both run: the
+second one finds the first one live and exits.
+
+### Socket path length
+
+Unix socket paths have an operating-system limit: about 104 bytes on macOS
+(the figure used in the source's error hint) and, per the platform's
+`sun_path` definition, typically 108 bytes on Linux. When a bind
+fails and the path is longer than 100 bytes, the error includes the hint
+`socket paths are limited to about 104 bytes on macOS; choose a shorter path`.
+For `ssh -R` forwarding, the limit applies to both ends independently, so both
+the host path and the VM path must fit.
+
+## Peer credential check
+
+For Unix connections the daemon asks the kernel who is on the other end of each
+accepted connection and compares that uid with its own. The lookup is in
+[peercred.go](../internal/endpoint/peercred.go) with one implementation per
+platform:
 
 | Platform | Mechanism | File |
 |---|---|---|
-| Linux   | `getsockopt(SOL_SOCKET, SO_PEERCRED)` returning `Ucred{Uid,…}`     | [`peercred_linux.go`](../internal/transport/peercred_linux.go) |
-| macOS   | `getsockopt(SOL_LOCAL, LOCAL_PEERCRED)` returning `Xucred{Uid,…}`  | [`peercred_darwin.go`](../internal/transport/peercred_darwin.go) |
-| other   | returns `-1, nil`                                                  | [`peercred_other.go`](../internal/transport/peercred_other.go) |
+| Linux | `SO_PEERCRED` (`GetsockoptUcred`) | [peercred_linux.go](../internal/endpoint/peercred_linux.go) |
+| macOS | `LOCAL_PEERCRED` (`GetsockoptXucred`) | [peercred_darwin.go](../internal/endpoint/peercred_darwin.go) |
+| Other | No credentials available | [peercred_other.go](../internal/endpoint/peercred_other.go) |
 
-The handler for `/op/execute` rejects mismatches:
+The uid is read once per connection in the server's `ConnContext` hook and stored
+in the request context. A middleware, `rejectForeignPeer`, wraps the whole route
+table in [server.go](../internal/daemon/server.go), so every route, including
+`/health` and `/token/refresh`, is covered, as well as unknown paths.
 
-```go
-if uid := peerUIDFromRequest(r); uid >= 0 {
-    if uid != os.Getuid() {
-        http.Error(w, "forbidden", http.StatusForbidden)
-        return
-    }
-}
-```
+| Situation | Outcome |
+|---|---|
+| Peer uid equals the daemon's uid | Request proceeds to its handler |
+| Peer uid differs | `403 forbidden`; the daemon logs `refused connection from uid N (daemon runs as uid M)` |
+| No credentials available (TCP connection, or a platform without support) | Request proceeds to the bearer-token check |
 
-A few subtleties:
+The check is a second layer behind the 0600 mode and the 0700 directory. Its
+purpose, as stated in the source, is to refuse another user even if the socket
+file is exposed with looser permissions, for example through a shared directory
+or a permissive `StreamLocalBindMask` in sshd.
 
-- A `uid < 0` is treated as "credentials unavailable" and the check is
-  skipped. This happens on platforms without peer-cred support and (in
-  principle) when the SSH forwarder rebinds across user boundaries in ways
-  Linux/macOS don't expose. The Bearer token is still required.
-- Only `/op/execute` enforces the UID match. `/health` is unauthenticated by
-  design, and `/token/refresh` relies on the refresh token being a secret —
-  see [`security.md` § Why /token/refresh skips the UID check](security.md#why-tokenrefresh-skips-the-uid-check).
-- The check is done once per *connection*, not per *request*. For a Unix
-  socket that distinction is irrelevant because the kernel ties credentials
-  to the socket pair at `connect()` time.
+### What the check can and cannot see
 
-## SSH `RemoteForward` of Unix sockets
+The kernel reports the identity of the process that opened the connection to
+the daemon's socket. This follows from how OpenSSH forwards streams: over
+`ssh -R` socket forwarding the host-side `ssh` client makes the local connection
+to the daemon's socket, so the process the kernel reports is that `ssh` client
+running as the host user, not the process on the VM that connected to the
+forwarded socket. The arrangement was exercised end to end during development.
+Consequently:
 
-OpenSSH 6.7+ supports forwarding Unix sockets (`man ssh.1`, `-R` syntax). In
-this architecture the daemon listens on a socket on the **macOS host**, and
-the proxy on the **VM** dials a socket that SSH ties to the daemon's socket.
+- Every forwarded request arrives with the host user's uid. The peer check
+  passes for all VM users; it cannot distinguish one VM user from another.
+- Access control between users on the VM is provided by the VM-side socket's
+  permissions (set by the VM's sshd) and by the bearer token files, which are
+  readable only by their owner when created by op-forward.
+- The peer check is meaningful for processes that connect directly to the host
+  socket, that is, other accounts on the host.
 
-`ssh -R remote_socket:local_socket destination` listens on `remote_socket`
-on the SSH **server** (the destination of the SSH command) and forwards to
-`local_socket` on the SSH **client** (the machine running `ssh`). For us
-that means:
+The repository's automated tests exercise the check with direct connections and
+with injected peer uids ([peercred_test.go](../internal/endpoint/peercred_test.go),
+[transport_test.go](../internal/daemon/transport_test.go)); they do not go
+through SSH.
 
-- The SSH command runs **on the macOS host** (the client).
-- The SSH destination is **the VM** (the server).
-- `remote_socket` is the path SSH creates on the VM. Must be absolute on
-  the VM's filesystem.
-- `local_socket` is the path the daemon listens on. Must be absolute on the
-  macOS host's filesystem.
+## SSH remote forwarding
 
-Both paths are evaluated by the local shell on the host before `ssh`
-launches; `$HOME` is **not** re-expanded on the VM. Use literal absolute
-paths (or shell variables that expand on the host) for both sides.
-
-Recommended pattern:
+### Forwarding a TCP port
 
 ```bash
-# Run on the macOS host. <vm> is the SSH destination (alias / hostname / user@host).
-HOST_SOCKET="$HOME/Library/Caches/op-forward/op-forward.sock"
-VM_SOCKET="/home/$USER/.cache/op-forward/op-forward.sock"
-
-ssh -fN -R "$VM_SOCKET:$HOST_SOCKET" \
-    -o ControlMaster=no \
-    -o ControlPath=none \
-    <vm>
-
-# Then on the VM:
-export OP_FORWARD_SOCKET_PATH="/home/$USER/.cache/op-forward/op-forward.sock"
+# Run on the host. <vm> is an SSH destination.
+ssh -R 18340:127.0.0.1:18340 <vm>
 ```
 
-Adjust `VM_SOCKET` if the VM does not use the Linux-standard `/home/<user>`
-layout — e.g. set it to `/run/user/<uid>/op-forward.sock` to land in
-`$XDG_RUNTIME_DIR` on the VM, or to a `/tmp` path under unusual layouts.
+Per the OpenSSH documentation, the listening port is bound to the VM's loopback
+interface unless `GatewayPorts` is enabled on the VM's sshd (it is off by
+default). Any user on the VM can open
+that port, so the bearer token is the only barrier between VM users. The host
+daemon must be on TCP (`OP_FORWARD_PORT=18340` or `--port 18340`), and the VM
+side needs `OP_FORWARD_PORT=18340` (or `OP_FORWARD_ADDR=tcp://127.0.0.1:18340`),
+since without it the proxy dials the default Unix socket.
 
-Notes:
+For long-lived tunnels:
 
-- `OP_FORWARD_SOCKET_PATH` on the VM must equal the path you passed to `-R`
-  as `remote_socket` (i.e. the VM-side path).
-- `ControlMaster=no` plus `ControlPath=none` disables SSH connection
-  multiplexing. With multiplexing, only the *first* SSH connection sets up
-  `RemoteForward`; later connections share the master channel and do **not**
-  re-establish forwarding. A dedicated tunnel connection avoids this surprise
-  entirely. See [`deployment.md` § Multiplexing pitfall](deployment.md#multiplexing-pitfall).
-- `-fN` puts the tunnel in the background and runs no remote command, so the
-  connection lives until you kill it.
-- `ssh` will fail with `Error: remote port forwarding failed for listen path
-  …` if the VM-side parent directory doesn't exist or isn't writable by the
-  SSH user. Pre-create it with `mkdir -p ~/.cache/op-forward && chmod 700
-  ~/.cache/op-forward` on the VM.
-
-## HTTP-over-Unix client
-
-Standard `net/http` clients dial TCP. The proxy rebinds the dialer:
-
-```go
-transportRT := &http.Transport{
-    DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-        return (&net.Dialer{Timeout: 1 * time.Second}).DialContext(ctx, "unix", socketPath)
-    },
-}
-client := &http.Client{Timeout: httpTimeout, Transport: transportRT}
+```bash
+ssh -fN -R 18340:127.0.0.1:18340 -o ControlMaster=no -o ControlPath=none <vm>
 ```
 
-Requests use a synthetic `Host` header — the proxy POSTs to URLs of the form
-`http://unix/op/execute` and `http://unix/token/refresh`. The host literal
-`unix` is arbitrary and only there because the URL parser requires *something*.
+`ControlMaster=no` matters when multiplexing is configured elsewhere: per the
+OpenSSH documentation, a multiplexed session reuses the first connection, so
+`RemoteForward` is established only by the first connection.
 
-The proxy does a separate dial-and-close probe before constructing the HTTP
-client. This catches "tunnel down" failures without sending an authenticated
-request and lets the proxy exit `127` (so the bash shim can fall back to a
-real `op`) without spending a Touch ID approval. The probe timeout is
-`OP_FORWARD_PROBE_TIMEOUT_MS` (default 500 ms).
+### Forwarding a Unix socket
 
-## Connection lifecycle
+```bash
+# Host: the daemon binds its default socket
+# (~/Library/Caches/op-forward/op-forward.sock unless XDG_RUNTIME_DIR is set)
+op-forward serve
 
-The daemon's HTTP server uses these timeouts (set in `Server.Start`):
+# Host: forward it. The VM-side path is spelled out because the host shell
+# expands $HOME and ~ before ssh sees them.
+ssh -R /home/<vm-user>/.cache/op-forward/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock <vm>
 
-| Timeout       | Value                    | Why |
-|---------------|--------------------------|-----|
-| `ReadTimeout`  | `30 * time.Second`        | Caps slow request bodies. The body is also bounded to 1 MiB by `http.MaxBytesReader`. |
-| `WriteTimeout` | `executor.MaxTimeout + 10s` (`5m10s`) | Long enough to outlast a maximum-length `op` invocation plus framing overhead. |
-| `IdleTimeout`  | `120 * time.Second`       | Keep-alive cap; SSH-forwarded sockets reuse connections across short bursts of `op` calls. |
+# VM: point the proxy at the forwarded socket
+export OP_FORWARD_SOCKET_PATH="/home/<vm-user>/.cache/op-forward/op-forward.sock"
+```
 
-The PTY-spawned `op` itself is bounded by `executor.MaxTimeout = 5m`. A
-client-supplied `timeout_ms` shorter than that is honored; a longer one is
-clamped down. See [`protocol.md` § Timeouts](protocol.md#timeouts).
+Points to know:
 
-## CWE alignment
+- **Leftover sockets on the VM.** sshd does not remove a forwarded socket when
+  the connection drops, so the next `ssh -R` fails with OpenSSH's `Address already
+  in use` error. Set `StreamLocalBindUnlink yes` in the VM's `/etc/ssh/sshd_config` so
+  sshd replaces the stale file.
+- **Parent directory.** The VM-side directory must already exist; sshd does not
+  create it.
+- **VM-side permissions.** sshd creates the VM-side socket using its
+  `StreamLocalBindMask` (per the OpenSSH documentation the default is 0177,
+  owner only). Leave it restrictive.
+- **Path lengths.** See [Socket path length](#socket-path-length).
+- **Host-side rules.** The host path must satisfy the directory and permission
+  rules above. `~/Library/Caches/op-forward` on macOS satisfies them because the
+  daemon creates it with mode 0700 when it writes the token files, provided the
+  directory did not already exist with looser permissions.
 
-The original design note that became this page mapped the changes to CWE
-identifiers:
+The `ssh` and `sshd` options named here are OpenSSH behavior as documented by
+OpenSSH, not behavior implemented in this repository.
 
-| CWE | Issue | Mitigation |
-|---|---|---|
-| CWE-22  | Path traversal | Token persistence uses `os.Root` (`os.OpenRoot` + `Root.WriteFile`/`Root.Rename`). Socket paths are `Clean`ed and must be absolute. |
-| CWE-200 | Information exposure to unintended actor | Filesystem-mode socket; only same-UID can connect. |
-| CWE-284 | Improper access control | Mode `0700`/`0600` plus peer-UID check. |
-| CWE-306 | Missing authentication | Bearer token retained on top of FS controls. |
-| CWE-400 | Uncontrolled resource consumption | `MaxBytesReader(1 MiB)`, request/idle timeouts, PTY-output bounded by `executor.MaxTimeout`. |
-| CWE-922 | Insecure storage | `0600` token files via atomic temp-rename through `os.Root`. |
+## Docker Desktop containers
+
+Containers on Docker Desktop reach the host through the `host.docker.internal`
+name. Point the proxy at it with TCP:
+
+```bash
+# Inside the container
+export OP_FORWARD_HOST=host.docker.internal
+# or the full form:
+export OP_FORWARD_ADDR=tcp://host.docker.internal:18340
+```
+
+The daemon must listen on loopback TCP for this (`OP_FORWARD_PORT=18340` or
+`--port 18340` on the host, since its default is the Unix socket). It stays
+bound to `127.0.0.1`; Docker Desktop routes the name to the
+host, so no SSH tunnel is needed. This is the case that motivated the dial-side
+exception to loopback-only addressing. Reachability through `host.docker.internal`
+was verified empirically against Docker Desktop during development.
+
+Use TCP for containers. A Unix socket on the host cannot be bind-mounted into a
+Docker Desktop container: `docker run` fails at mount time with `operation not
+supported`, so a `unix://` endpoint cannot serve a container on that platform.
+This too was verified empirically against Docker Desktop during development. The container still needs the token files; see
+[deployment.md](deployment.md#docker-desktop-containers).
+
+## Dial side behavior
+
+The proxy builds an HTTP client from the endpoint. For TCP it uses the default
+transport. For Unix endpoints it uses a custom dialer that ignores the host in
+the request URL (the placeholder `http://unix`) and connects to the socket path.
+
+Before any request, the proxy probes the endpoint by opening and closing a
+connection with a timeout from `OP_FORWARD_PROBE_TIMEOUT_MS` (default 500 ms).
+If the probe fails, the proxy prints `daemon not reachable at ENDPOINT` and exits
+with status 127, which makes the shim fall back to the real `op`. The dial side
+performs no directory or ownership checks on a Unix socket path.
+
+The `update` command uses the same client to wait for `/health` after it
+restarts the daemon (see [cli.md](cli.md#update)).
 
 ## See also
 
-- [`internal/transport/socket.go`](../internal/transport/socket.go),
-  [`peercred_linux.go`](../internal/transport/peercred_linux.go),
-  [`peercred_darwin.go`](../internal/transport/peercred_darwin.go),
-  [`peercred_other.go`](../internal/transport/peercred_other.go)
-- [`protocol.md`](protocol.md) — what flows on top of the socket
-- [`tokens.md`](tokens.md) — what's in the `Authorization` header
-- [`deployment.md`](deployment.md) — concrete SSH commands
-
-External references:
-
-- Go `net` package, Unix-domain support — <https://pkg.go.dev/net>
-- Go `os.Root` traversal-resistant API — <https://pkg.go.dev/os#Root>
-- OpenSSH `ssh(1)` man page (`-R` Unix-socket syntax) — <https://man.openbsd.org/ssh.1>
-- Linux `unix(7)` and `SO_PEERCRED` — <https://man7.org/linux/man-pages/man7/unix.7.html>
+- [protocol.md](protocol.md) for what runs over the transport
+- [security.md](security.md#1-loopback-only-binding) for how the transport rules fit the threat model
+- [deployment.md](deployment.md#ssh-tunnel-patterns) for tunnel recipes and troubleshooting
+- [configuration.md](configuration.md) for the variables that select an endpoint

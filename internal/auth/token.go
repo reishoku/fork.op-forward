@@ -33,25 +33,28 @@ type Token struct {
 }
 
 // GenerateAccess creates a new random access token with a 1-hour TTL.
-func GenerateAccess() (*Token, error) {
+func GenerateAccess() *Token {
 	return generate(AccessTokenTTL)
 }
 
 // GenerateRefresh creates a new random refresh token with a 30-day TTL.
-func GenerateRefresh() (*Token, error) {
+func GenerateRefresh() *Token {
 	return generate(RefreshTokenTTL)
 }
 
-func generate(ttl time.Duration) (*Token, error) {
+func generate(ttl time.Duration) *Token {
 	b := make([]byte, TokenLength)
-	if _, err := rand.Read(b); err != nil {
-		return nil, fmt.Errorf("generating token: %w", err)
-	}
+	// Since Go 1.24, crypto/rand.Read never returns an error: the runtime
+	// aborts the program if randomness is unavailable, so a token can never
+	// be built from unfilled bytes. The go directive in go.mod enforces a
+	// newer minimum at build time, which makes this guarantee load-bearing
+	// rather than assumed.
+	_, _ = rand.Read(b)
 	return &Token{
 		Value:   hex.EncodeToString(b),
 		Expires: time.Now().Add(ttl),
 		TTL:     ttl,
-	}, nil
+	}
 }
 
 // IsValid returns true if the token hasn't expired.
@@ -72,26 +75,19 @@ func (t *Token) Renew() {
 
 // ---------- Path helpers ----------
 
-func sanitizePath(raw string) (string, error) {
-	if raw == "" {
-		return "", fmt.Errorf("empty path")
-	}
-	return filepath.Clean(raw), nil
-}
-
 // TokenDir returns the directory for storing tokens.
 func TokenDir() (string, error) {
 	if dir := os.Getenv("OP_FORWARD_TOKEN_DIR"); dir != "" {
-		return sanitizePath(dir)
+		return filepath.Clean(dir), nil
 	}
 	if state := os.Getenv("XDG_STATE_HOME"); state != "" {
-		return sanitizePath(filepath.Join(state, CacheDirName))
+		return filepath.Join(state, CacheDirName), nil
 	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("determining cache directory: %w", err)
 	}
-	return sanitizePath(filepath.Join(cacheDir, CacheDirName))
+	return filepath.Join(cacheDir, CacheDirName), nil
 }
 
 func tokenFilePath(name string) (string, error) {
@@ -106,7 +102,7 @@ func tokenFilePath(name string) (string, error) {
 // Respects OP_FORWARD_TOKEN_FILE for backward compatibility.
 func AccessTokenPath() (string, error) {
 	if path := os.Getenv("OP_FORWARD_TOKEN_FILE"); path != "" {
-		return sanitizePath(path)
+		return filepath.Clean(path), nil
 	}
 	return tokenFilePath(AccessTokenFile)
 }
@@ -144,7 +140,9 @@ func SaveToPath(t *Token, path string) error {
 	if err != nil {
 		return fmt.Errorf("opening token root: %w", err)
 	}
-	defer root.Close()
+	// Closing the root only releases its directory handle; the token file was
+	// written and closed by root.WriteFile, so there is nothing to report.
+	defer func() { _ = root.Close() }()
 
 	content := fmt.Sprintf("%s\n%s\n", t.Value, t.Expires.Format(time.RFC3339))
 	tmp := base + ".tmp"
@@ -152,6 +150,8 @@ func SaveToPath(t *Token, path string) error {
 		return fmt.Errorf("writing token: %w", err)
 	}
 	if err := root.Rename(tmp, base); err != nil {
+		// Best-effort removal of the staged temp file; the rename failure
+		// returned below is the actionable error.
 		_ = root.Remove(tmp)
 		return fmt.Errorf("renaming token file: %w", err)
 	}
@@ -171,7 +171,8 @@ func LoadFromPath(path string) (*Token, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening token root: %w", err)
 	}
-	defer root.Close()
+	// Closing the root only releases its directory handle after the read.
+	defer func() { _ = root.Close() }()
 
 	data, err := root.ReadFile(base)
 	if err != nil {
@@ -223,10 +224,7 @@ func LoadOrGenerateRefresh() (*Token, bool, error) {
 		t.TTL = RefreshTokenTTL
 		return t, false, nil
 	}
-	t, err = GenerateRefresh()
-	if err != nil {
-		return nil, false, err
-	}
+	t = GenerateRefresh()
 	if err := SaveToPath(t, path); err != nil {
 		return nil, false, err
 	}
@@ -271,10 +269,7 @@ func LoadOrGenerate() (*Token, bool, error) {
 		token.TTL = AccessTokenTTL
 		return token, false, nil
 	}
-	token, err = GenerateAccess()
-	if err != nil {
-		return nil, false, err
-	}
+	token = GenerateAccess()
 	if err := token.Save(); err != nil {
 		return nil, false, err
 	}

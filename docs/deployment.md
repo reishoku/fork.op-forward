@@ -1,390 +1,420 @@
 # Deployment
 
-This page is the operational guide. It walks through installing op-forward on
-both sides, wiring up the SSH tunnel, and validating the result. The
-quickstart in [`../README.md`](../README.md) is the abridged version of this
-page; everything here is meant to compose with the quickstart, not replace
-it.
+This page covers installing op-forward on the host and on remote machines,
+deploying tokens, connecting the two with SSH, and diagnosing problems. Command
+details are in [cli.md](cli.md); variables are in
+[configuration.md](configuration.md).
 
-For why the design looks like this, see [`architecture.md`](architecture.md).
-For the security implications of each step, see [`security.md`](security.md).
+## Topologies
 
-## Host (macOS)
+| Topology | Transport | Section |
+|---|---|---|
+| VM or server reached over SSH, forwarded port | TCP | [TCP port](#tcp-port) |
+| VM or server reached over SSH, forwarded socket | Unix socket | [Unix socket](#unix-socket) |
+| Colima or Lima VM | TCP or Unix socket over the VM's SSH config | [Colima and Lima](#colima-and-lima) |
+| Docker Desktop container | TCP to `host.docker.internal` | [Docker Desktop containers](#docker-desktop-containers) |
 
-### 1. Install the binary
+In every case the host runs one daemon, and each remote machine has the
+`op-forward` binary, the `op` shim, and token files.
 
-Pick one. They produce the same binary; choose based on how you maintain the
-rest of the host.
+## Host setup
 
-- **Homebrew tap**:
+The host is the machine with the 1Password desktop application and Touch ID,
+normally a Mac. It needs the 1Password CLI (`op`) installed and integrated with
+the desktop application, so that `op` works in a local terminal.
 
-  ```bash
-  brew install reishoku/tap/op-forward
-  ```
+Install the binary with Homebrew, the install script, or a source build:
 
-  Subsequent updates with `brew upgrade reishoku/tap/op-forward`. The tap is
-  refreshed automatically on each release; see
-  [`development.md` § Release pipeline](development.md#release-pipeline).
+```bash
+brew install reishoku/tap/op-forward
+# or
+curl -fsSL https://raw.githubusercontent.com/reishoku/fork.op-forward/reishoku/scripts/install.sh | sh
+```
 
-- **Install script**:
+The install script places the binary in `~/.local/bin` (override with
+`OP_FORWARD_INSTALL_DIR`) for macOS or Linux on amd64 or arm64. It does not
+verify a checksum.
 
-  ```bash
-  curl -fsSL https://raw.githubusercontent.com/reishoku/fork.op-forward/reishoku/scripts/install.sh | sh
-  ```
-
-  Drops `op-forward` into `$OP_FORWARD_INSTALL_DIR` (default
-  `~/.local/bin`). See [`configuration.md` § Installer](configuration.md#installer).
-
-- **From source**:
-
-  ```bash
-  git clone https://github.com/reishoku/fork.op-forward.git
-  cd fork.op-forward
-  go build -ldflags="-s -w -X github.com/reishoku/fork.op-forward/cmd.Version=$(git describe --tags --always)" -o op-forward .
-  install op-forward ~/.local/bin/op-forward
-  ```
-
-  Without the `-X …Version=…` flag the binary self-reports as `dev`, which
-  exempts it from version-negotiation enforcement. See
-  [`protocol.md` § Version negotiation](protocol.md#version-negotiation).
-
-### 2. Start the daemon
-
-For interactive testing:
+### Foreground daemon
 
 ```bash
 op-forward serve
 ```
 
-Expected output, in order:
+This listens on the Unix socket `~/Library/Caches/op-forward/op-forward.sock`
+(`$XDG_RUNTIME_DIR/op-forward.sock` when `XDG_RUNTIME_DIR` is set) and writes
+tokens to `~/Library/Caches/op-forward`. Use it for testing. To select another
+socket or loopback TCP:
 
+```bash
+op-forward serve --listen unix:///Users/me/.op-forward/op-forward.sock
+op-forward serve --port 18340
 ```
-Refresh token generated (no valid existing token found)        # first run only
-Refresh token at: /Users/you/Library/Caches/op-forward/refresh.token
-Access token written to: /Users/you/Library/Caches/op-forward/access.token (expires …)
-Starting daemon on unix:///Users/you/Library/Caches/op-forward/op-forward.sock
-op-forward daemon listening on unix:///Users/you/Library/Caches/op-forward/op-forward.sock
+
+Verify from the host:
+
+```bash
+curl -s --unix-socket ~/Library/Caches/op-forward/op-forward.sock http://unix/health
 ```
 
-The first time you run it, both `refresh.token` and `access.token` are
-created. On every subsequent start, the access token is regenerated and the
-refresh token is reused as long as it is unexpired. See
-[`tokens.md` § Daemon startup](tokens.md#daemon-startup).
-
-### 3. Persist via launchd
-
-For long-running use:
+### launchd service
 
 ```bash
 op-forward service install
 ```
 
-This writes `~/Library/LaunchAgents/com.op-forward.daemon.plist` and loads
-it. The plist:
+This writes `~/Library/LaunchAgents/com.op-forward.daemon.plist` and loads it.
+The service starts at login (`RunAtLoad`), is restarted if it exits
+(`KeepAlive`), and logs to `~/Library/Logs/op-forward.log`.
 
-- `Label` = `com.op-forward.daemon`
-- `ProgramArguments` = the resolved binary path + `serve`
-- `EnvironmentVariables.PATH` =
-  `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` —
-  needed so the daemon's `exec.LookPath("op")` finds the real `op` binary on
-  both Apple Silicon and Intel macs.
-- `EnvironmentVariables.HOME` = the current user's home — so the cache and
-  token directories resolve correctly under launchd's reduced env.
-- `RunAtLoad`, `KeepAlive` = `true` — auto-starts at login and respawns on
-  crash.
-- `StandardOutPath` and `StandardErrorPath` = `~/Library/Logs/op-forward.log`.
+Because launchd does not inherit your shell environment:
 
-To uninstall:
+- the listen endpoint is resolved when you run `service install` and stored as
+  `--listen` in the plist; to change it, export `OP_FORWARD_LISTEN` (or
+  `OP_FORWARD_PORT` / `OP_FORWARD_SOCKET_PATH`) and run `service install`
+  again;
+- `OP_FORWARD_TOKEN_DIR` and `OP_FORWARD_TOKEN_FILE` are not copied, so the
+  service uses the default token directory;
+- the service runs with `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+  so `op` must be installed in one of those directories.
+
+The plist records the resolved path of the binary. Run `service install` again
+after the binary moves, for example after a Homebrew upgrade replaces a
+versioned directory. Remove the service with `op-forward service uninstall`.
+
+## Remote setup
+
+Install `op-forward` on each remote machine by whichever route matches it, then
+run `op-forward install` as each user who will run `op`. Packages install
+`/usr/bin/op-forward`; the install script installs to `~/.local/bin`. Packages
+declare no dependencies, and the shim needs `/bin/bash`; minimal images that do
+not include Bash (the Alpine base image is an example) need it installed.
+
+Repository URLs below use the project's Pages site, `https://reishoku.github.io/fork.op-forward`.
+
+### APT (Debian and Ubuntu)
 
 ```bash
-op-forward service uninstall
+curl -fsSL https://reishoku.github.io/fork.op-forward/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/op-forward.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://reishoku.github.io/fork.op-forward stable main" | sudo tee /etc/apt/sources.list.d/op-forward.list
+sudo apt-get update && sudo apt-get install op-forward
 ```
 
-`service install` and `service uninstall` are macOS-only. On other platforms
-they error out — there is no built-in systemd equivalent yet.
+Architectures: amd64 and arm64. The index lists every published version, so an
+older version can be installed explicitly (`apt-get install op-forward=VERSION`).
 
-If `launchctl load -w` fails (newer macOS versions return `Bootstrap failed:
-5`), the command falls back to `launchctl bootstrap gui/<uid> <plist>`. The
-binary path stored in the plist is `EvalSymlinks`-resolved, so a Homebrew
-upgrade that swaps the symlink target keeps the plist valid as long as the
-canonical path remains.
+### RPM (Fedora, RHEL, openSUSE)
 
-## Remote (Linux VM)
+```bash
+sudo curl -fsSL https://reishoku.github.io/fork.op-forward/rpm/op-forward.repo -o /etc/yum.repos.d/op-forward.repo
+sudo dnf install op-forward
+```
 
-### 1. Install the binary
+Architectures: x86_64 and aarch64. The repository file enables `gpgcheck` and
+`repo_gpgcheck` and points `gpgkey` at the same `key.gpg` as the APT repository
+when the repository was built with a signing key.
 
-- **APT (Ubuntu/Debian)** — recommended for managed VMs:
+### Alpine (apk)
 
-  ```bash
-  curl -fsSL https://reishoku.github.io/fork.op-forward/key.gpg \
-    | sudo gpg --dearmor -o /usr/share/keyrings/op-forward.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://reishoku.github.io/fork.op-forward stable main" \
-    | sudo tee /etc/apt/sources.list.d/op-forward.list
-  sudo apt-get update
-  sudo apt-get install op-forward
-  ```
+```bash
+sudo curl -fsSL https://reishoku.github.io/fork.op-forward/apk/op-forward.rsa.pub -o /etc/apk/keys/op-forward.rsa.pub
+echo "https://reishoku.github.io/fork.op-forward/apk" | sudo tee -a /etc/apk/repositories
+sudo apk add op-forward
+```
 
-  Updates: `sudo apt-get update && sudo apt-get upgrade op-forward`.
+Architectures: x86_64 and aarch64. The Alpine repository is published only when
+the project's Alpine signing key is configured in the release pipeline.
 
-- **Manual download** — release assets are named
-  `op-forward_<version>_<os>_<arch>.tar.gz`, so the URL needs the version.
-  Either invoke `scripts/install.sh` (which fetches the latest tag and
-  composes the URL) or do it explicitly:
+### Arch Linux
 
-  ```bash
-  VERSION=$(curl -fsSL https://api.github.com/repos/reishoku/fork.op-forward/releases/latest \
-            | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
-  ARCH=$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/')
-  OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-  mkdir -p ~/.local/bin
-  curl -fsSL "https://github.com/reishoku/fork.op-forward/releases/download/v${VERSION}/op-forward_${VERSION}_${OS}_${ARCH}.tar.gz" \
-    | tar -xz -C ~/.local/bin/
-  ```
+Download the `.pkg.tar.zst` for your architecture from the
+[latest release](https://github.com/reishoku/fork.op-forward/releases/latest)
+and install it:
 
-  Make sure `~/.local/bin` is on `PATH` for both interactive shells and
-  non-interactive sessions (the daemon-spawned `op` runs in
-  non-interactive mode).
+```bash
+sudo pacman -U op-forward-<version>-1-x86_64.pkg.tar.zst
+```
 
-### 2. Install the `op` shim
+The release pipeline also generates an AUR definition for `op-forward-bin`
+(see [development.md](development.md#aur-package)), which it pushes when the
+project's AUR credentials are configured.
+
+### Static tarball and install script
+
+For distributions without a package, or for a per-user install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/reishoku/fork.op-forward/reishoku/scripts/install.sh | sh
+```
+
+Or download `op-forward_<version>_<os>_<arch>.tar.gz` from the release page and
+copy the `op-forward` binary to a directory on `PATH`. Linux binaries are
+statically linked, so they run on musl and older glibc systems.
+
+### Installing the shim
 
 ```bash
 op-forward install
 ```
 
-Writes `~/.local/bin/op` (a bash script). The script:
+This writes `~/.local/bin/op`. Ensure `~/.local/bin` precedes the directory
+containing the real `op` on `PATH`; the command reports whether `op` now
+resolves to the shim.
 
-1. Looks for `op-forward` next to itself (or via `os.Executable()` of the
-   running `op-forward`).
-2. Looks for the **real** `op` by walking `$PATH` and skipping
-   `~/.local/bin`. Falls back to `/usr/bin/op` if no real `op` is on PATH.
-3. On invocation, `exec`s `op-forward proxy -- "$@"` and uses its exit
-   code. Exit code `127` from the proxy means infrastructure is unavailable
-   — the script then falls through to the real `op` so that `op` continues
-   to work locally if the host daemon is unreachable.
+Packages from releases 0.7.2 and later install to `/usr/bin`; earlier releases
+used `/usr/local/bin`. The package's post-install script repairs shims it can
+find in `/home/*/.local/bin/op` and `/root/.local/bin/op`, rewriting only the
+recorded binary path and preserving ownership. A shim anywhere else needs
+`op-forward install` re-run. Shims written by the current template also look for
+`op-forward` on `PATH` when their recorded path is gone.
 
-The installer prints the `which op` resolution. If `op` resolves anywhere
-other than `~/.local/bin/op`, fix `PATH` so the shim wins.
+## Token deployment
 
-The shim path is hardcoded; `PATH` ordering is the only knob.
-
-### 3. Token deployment
-
-The proxy needs `refresh.token` (and ideally `access.token`) on the VM.
-There is no automated handoff — you copy them yourself once.
+Each remote machine needs the host's current `refresh.token`. Copy it into the
+remote token directory (`~/.cache/op-forward` on Linux):
 
 ```bash
-# From the host (macOS):
-scp -r ~/Library/Caches/op-forward/{access.token,refresh.token,session.token} \
-    vm:~/.cache/op-forward/
+ssh <vm> 'mkdir -p -m 700 ~/.cache/op-forward'
+scp ~/Library/Caches/op-forward/refresh.token <vm>:.cache/op-forward/refresh.token
+ssh <vm> 'chmod 600 ~/.cache/op-forward/refresh.token'
 ```
 
-Notes:
+No access token needs to be copied: on the first command the proxy finds no
+access token, refreshes, and writes `access.token` and a new `refresh.token`
+itself.
 
-- The destination directory must be the VM's resolved `TokenDir()`. If
-  `XDG_STATE_HOME` is set on the VM, target `$XDG_STATE_HOME/op-forward`
-  instead. See [`configuration.md` § Tokens](configuration.md#tokens).
-- `access.token` is optional — the proxy will refresh on the first 401 if
-  only `refresh.token` is present.
-- `session.token` is helpful only for old proxy clients (pre-two-tier).
-  Including it does no harm.
-- File mode is preserved by `scp` for `0600` files only if the source
-  filesystem reports it correctly; verify with `stat` after copy.
-- Subsequent re-deployments are usually only needed when the refresh token
-  has expired (more than 30 days unused) or you have wiped the host token
-  directory.
+The daemon keeps one token pair, and every refresh replaces it. If you copy the
+same token files to several machines, the first one to refresh invalidates the
+copies on the others. Machines that share a home directory share one token
+directory and see each other's refreshed files; for the rest, redeploy
+`refresh.token` to a machine that stops working. The mechanics are in [tokens.md](tokens.md#refresh-endpoint-behavior).
 
-### 4. Bring up the SSH tunnel
+Containers that start fresh each time need the token files provided at startup,
+by whatever mechanism your environment uses to supply files to containers; the
+proxy writes refreshed tokens back to its token directory, which is lost if the
+directory is not persistent.
 
-The SSH command is run **on the macOS host**; its destination argument is
-the **VM**. `ssh -R remote_socket:local_socket destination` listens on
-`remote_socket` on the SSH server (the VM) and forwards to `local_socket`
-on the SSH client (the host). Both paths are evaluated by the host's local
-shell before `ssh` launches — `$HOME` is **not** re-expanded on the VM, so
-write the VM-side path explicitly.
+The older `session.token` file is still honored for machines that have it; see
+[tokens.md](tokens.md#legacy-token-migration).
+
+## SSH tunnel patterns
+
+### Unix socket (default)
 
 ```bash
-# Run on the macOS host. <vm> is the SSH destination (alias / hostname / user@vm).
-HOST_SOCKET="$HOME/Library/Caches/op-forward/op-forward.sock"
-VM_SOCKET="/home/$USER/.cache/op-forward/op-forward.sock"
+# Host: the daemon listens on its default socket
+op-forward serve            # or: op-forward service install
 
-ssh -fN -R "$VM_SOCKET:$HOST_SOCKET" \
-    -o ControlMaster=no \
-    -o ControlPath=none \
-    <vm>
+# Host: forward the socket (VM-side path written out in full)
+ssh -R /home/<vm-user>/.cache/op-forward/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock <vm>
 
-# Then on the VM:
-export OP_FORWARD_SOCKET_PATH="/home/$USER/.cache/op-forward/op-forward.sock"
+# VM
+export OP_FORWARD_SOCKET_PATH="/home/<vm-user>/.cache/op-forward/op-forward.sock"
 ```
 
-Adjust `VM_SOCKET` if the VM does not use the Linux-standard
-`/home/<user>` layout. For example, on systemd hosts a path under
-`$XDG_RUNTIME_DIR` (typically `/run/user/<uid>`) is a good choice.
+Set `OP_FORWARD_SOCKET_PATH` on the VM to the forwarded path: without it the
+proxy dials `$XDG_RUNTIME_DIR/op-forward.sock` when `XDG_RUNTIME_DIR` is set
+and `~/.cache/op-forward/op-forward.sock` otherwise, and `XDG_RUNTIME_DIR` is
+typically set in SSH logins but not in every context the shim runs in.
+`OP_FORWARD_ADDR=unix:///...` is the equivalent full form.
 
-What each flag does:
+On the VM, set `StreamLocalBindUnlink yes` in `/etc/ssh/sshd_config` so that a
+socket left from a previous connection is replaced, and create the socket's
+directory beforehand. Keep both paths under the operating-system limit of
+roughly 104 bytes on macOS. Rules and caveats are in
+[transport.md](transport.md#ssh-remote-forwarding).
 
-| Flag                       | Purpose |
-|----------------------------|---------|
-| `-fN`                      | Background; do not run a remote command. The tunnel persists until the SSH process exits. |
-| `-R VM_SOCKET:HOST_SOCKET` | Listen on `VM_SOCKET` on the VM (SSH server) and forward to `HOST_SOCKET` on the macOS host (SSH client). |
-| `-o ControlMaster=no`      | Disable creating a master multiplex channel. |
-| `-o ControlPath=none`      | Disable joining an existing master channel. |
+### TCP port
 
-If `ssh` reports `Error: remote port forwarding failed for listen path …`,
-the parent of `VM_SOCKET` doesn't exist or isn't writable by the SSH user.
-Pre-create it on the VM with `mkdir -p ~/.cache/op-forward && chmod 700
-~/.cache/op-forward`.
-
-### Multiplexing pitfall
-
-If `~/.ssh/config` enables `ControlMaster`/`ControlPath` for this host
-(common for fast `git`/scp), only the *first* SSH connection sets up
-`RemoteForward`. Later connections share the master and **silently** lack
-forwarding — the proxy then sees a missing socket file and exits `127`.
-
-The two `-o` flags above bypass this. You can also dedicate a separate
-config block for the tunnel:
-
-```sshconfig
-Host op-forward-tunnel
-    HostName real-host
-    ControlMaster no
-    ControlPath none
-    RemoteForward /home/you/.cache/op-forward/op-forward.sock /Users/you/Library/Caches/op-forward/op-forward.sock
-```
-
-### Lima / Colima
-
-For VMs managed by [Lima](https://github.com/lima-vm/lima) or
-[Colima](https://github.com/abiosoft/colima), use the per-VM ssh config:
+Select TCP on the host by setting `OP_FORWARD_PORT` (or `--port`, or
+`OP_FORWARD_LISTEN=tcp://127.0.0.1:18340`) before `serve` or `service install`.
 
 ```bash
-# Run on the macOS host. First, discover the VM-side $HOME (one-time).
+# From the host
+ssh -R 18340:127.0.0.1:18340 <vm>
+
+# Background, dedicated connection
+ssh -fN -R 18340:127.0.0.1:18340 -o ControlMaster=no -o ControlPath=none <vm>
+```
+
+On the remote side, set `OP_FORWARD_PORT` to the forwarded port (or
+`OP_FORWARD_ADDR=tcp://127.0.0.1:18340`); without it the proxy dials the
+default Unix socket. A persistent
+`RemoteForward 18340 127.0.0.1:18340` entry in `~/.ssh/config` is equivalent.
+
+Use `ControlMaster=no` and `ControlPath=none` (or a dedicated host entry) when
+you rely on connection multiplexing elsewhere: per the OpenSSH documentation, a
+multiplexed session reuses the first connection, so `RemoteForward` is
+established only by the first connection.
+
+## Colima and Lima
+
+Colima and Lima VMs are reachable over SSH with a per-profile configuration
+file. Use it directly:
+
+```bash
+# Discover the VM-side $HOME once, since macOS and VM user names can differ
 VM_HOME=$(ssh -F ~/.colima/_lima/<vm-profile>/ssh.config lima-<vm-profile> 'printenv HOME')
 
-HOST_SOCKET="$HOME/Library/Caches/op-forward/op-forward.sock"
-VM_SOCKET="$VM_HOME/.cache/op-forward/op-forward.sock"
-
-ssh -fN -R "$VM_SOCKET:$HOST_SOCKET" \
+ssh -fN -R "$VM_HOME/.cache/op-forward/op-forward.sock:$HOME/Library/Caches/op-forward/op-forward.sock" \
     -o ControlMaster=no \
     -o ControlPath=none \
     -F ~/.colima/_lima/<vm-profile>/ssh.config \
     lima-<vm-profile>
 ```
 
-The `-F` argument points at Lima's per-VM SSH config; the `-o` overrides
-shadow any multiplexing it might enable. Resolving `VM_HOME` once via SSH
-sidesteps username differences between macOS and the Linux VM (Colima
-defaults to a Linux user that mirrors the macOS username, but Lima can be
-configured otherwise).
+`ControlMaster=no` and `ControlPath=none` avoid the multiplexing issue
+described above. Set `OP_FORWARD_SOCKET_PATH` in the VM as in
+[Unix socket](#unix-socket-default). The TCP variant works the same way with
+the `-R 18340:127.0.0.1:18340` form. Colima's profile names and file locations are defined by
+Colima and Lima; check them against your installation.
 
-### 5. Verify the tunnel
+## Docker Desktop containers
 
-The simplest end-to-end check is a `health` request:
-
-```bash
-# On the VM:
-curl --unix-socket "$OP_FORWARD_SOCKET_PATH" http://unix/health
-# expected: {"status":"ok"}
-```
-
-If that works, run an actual `op` command. The first invocation will trigger
-Touch ID on the host:
+For containers on the same Mac as the daemon, no SSH tunnel is needed, but the
+daemon must listen on loopback TCP (see [TCP port](#tcp-port)):
 
 ```bash
-op account list
+# On the host
+export OP_FORWARD_PORT=18340
+op-forward service install
+
+# Inside the container, after supplying the token files
+export OP_FORWARD_HOST=host.docker.internal
+op-forward install
 ```
 
-On success, every subsequent `op` call also triggers Touch ID — that is the
-PTY-per-call mechanism described in
-[`security.md` § Touch ID per call](security.md#6-touch-id-per-call).
+The full form is `OP_FORWARD_ADDR=tcp://host.docker.internal:18340`. Keep the
+daemon on TCP; a host Unix socket cannot be bind-mounted
+into a Docker Desktop container (see
+[transport.md](transport.md#docker-desktop-containers); both Docker Desktop
+claims were verified empirically during development). The shim reads the
+variable each time it runs, so set it in the container's environment (an image
+`ENV`, a devcontainer setting, or a shell profile).
 
-## Updating
+## Upgrading
 
-The host can self-update:
+| Installed with | Upgrade with | Notes |
+|---|---|---|
+| Homebrew | `brew upgrade reishoku/tap/op-forward` | Re-run `op-forward service install` if the service's recorded binary path changed |
+| Install script or tarball | `op-forward update` | Stops the running daemon (SIGTERM) and relies on the supervisor (launchd) to start the new binary, then waits for `/health`; without a supervisor the daemon stays down |
+| APT, dnf, apk | `apt-get upgrade`, `dnf upgrade`, `apk upgrade` | The binary lives in `/usr/bin` |
+| Arch package | Download and `pacman -U` the new package | |
 
-```bash
-op-forward update
-```
-
-This:
-
-1. Queries the GitHub Releases API for the latest tagged version of
-   `reishoku/fork.op-forward`.
-2. Downloads the platform-appropriate `op-forward_<version>_<os>_<arch>.tar.gz`.
-3. Extracts the binary, writes it as `<exec>.update`, and `Rename`s it over
-   the running binary atomically.
-4. `pgrep`s for `op-forward serve`, `SIGTERM`s the running daemon. launchd
-   re-spawns it with the new binary because of `KeepAlive=true`.
-
-If you installed via Homebrew, prefer `brew upgrade reishoku/tap/op-forward`
-so the formula stays in sync — `op-forward update` will replace the binary
-contents but Homebrew's records will then be wrong.
-
-The remote (VM) side also accepts `op-forward update`, but APT-managed
-installs should prefer `apt-get upgrade op-forward`.
+After upgrading the host binary, the running daemon must be restarted to run the
+new version. `op-forward update` signals the daemon to stop and expects launchd to
+start it again; a daemon started by hand is not restarted. Older clients keep working
+unless the daemon's minimum version excludes them (see
+[protocol.md](protocol.md#version-negotiation)).
 
 ## Troubleshooting
 
-### `op-forward: unix socket tunnel not available at <path>`
+Daemon output goes to the terminal when run in the foreground and to
+`~/Library/Logs/op-forward.log` under launchd. On the remote side, run the proxy
+directly to see its message and status:
 
-The SSH `RemoteForward` is not in place, the path on the VM does not match
-`OP_FORWARD_SOCKET_PATH`, or sshd refused to bind the remote socket. Check:
+```bash
+op-forward proxy -- account list; echo "exit=$?"
+```
 
-- `ls -l "$OP_FORWARD_SOCKET_PATH"` on the VM — does the socket inode exist?
-- `ssh -O check user@host` — is the SSH connection alive?
-- Re-run the SSH command without `-fN` to see error output (especially
-  `bind: Address already in use`, which means a stale socket file).
-- If using SSH multiplexing, see [Multiplexing pitfall](#multiplexing-pitfall).
+### Daemon not reachable
 
-### `403 Forbidden` from the daemon
+Symptom: `op-forward: daemon not reachable at unix:///home/me/.cache/op-forward/op-forward.sock`
+(or a TCP endpoint), exit 127, and the shim runs the real `op` instead.
 
-The daemon's peer-credential check failed: the connecting UID does not match
-the daemon's UID. Plausible causes:
+Causes and checks:
 
-- The SSH `RemoteForward` is bridging *different* user accounts on the two
-  ends. Run the daemon and the tunnel as the same user.
-- A `setuid` binary on the VM is invoking `op-forward proxy`. Don't do that.
+1. The daemon is not running: on the host,
+   `curl -s --unix-socket ~/Library/Caches/op-forward/op-forward.sock http://unix/health`
+   (or `curl -s http://127.0.0.1:18340/health` for TCP) should print
+   `{"status":"ok"}`; check the launchd job and the log.
+2. The tunnel is down or was never started: restart `ssh -R ...`.
+3. The remote side points at a different endpoint than the one forwarded; compare
+   `OP_FORWARD_ADDR`, `OP_FORWARD_SOCKET_PATH`, `XDG_RUNTIME_DIR`,
+   `OP_FORWARD_HOST`, and `OP_FORWARD_PORT` with the tunnel.
+4. The remote port or socket path was already taken, so `ssh -R` could not
+   bind it; OpenSSH reports the failure when the tunnel starts (for a socket,
+   see `StreamLocalBindUnlink` above).
+5. The probe timed out on a slow link; raise `OP_FORWARD_PROBE_TIMEOUT_MS`.
 
-See [`transport.md` § Peer-credential enforcement](transport.md#peer-credential-enforcement).
+### 403 forbidden
 
-### `op-forward: token refresh failed`
+Symptom: `op-forward: daemon returned HTTP 403` with body `forbidden`.
 
-The refresh token on the VM does not match the one the daemon currently
-holds in memory. Causes and fixes:
+The daemon refused the connection because the connecting process's uid on the
+host differs from the daemon's. This happens only with Unix sockets. The daemon
+log shows `refused connection from uid N (daemon runs as uid M)`. Typical cause:
+the daemon and the `ssh -R` client run as different users, for example a daemon
+started with `sudo` and a tunnel started as a normal user. Run both as the same
+user. See [transport.md](transport.md#peer-credential-check).
 
-- Refresh token is past its 30-day expiry → re-deploy from the host.
-- Host token directory was wiped → daemon now holds a *new* refresh token
-  whose value the VM does not have → re-deploy from the host.
-- The proxy is reading a stale token from `session.token` instead of
-  `refresh.token` → delete `session.token` on the VM.
+### 401 or token refresh failed
 
-See [`tokens.md` § Failure modes](tokens.md#failure-modes).
+Symptom: `op-forward: token refresh failed — ...` or `daemon returned HTTP 401`.
 
-### Touch ID does not prompt for every call
+Redeploy the host's `refresh.token` as shown in
+[Token deployment](#token-deployment). If several machines share one daemon, see
+the note there about rotation. Meanings of each message are in
+[tokens.md](tokens.md#failure-modes).
 
-That is a 1Password setting, not an op-forward setting. Open 1Password →
-Settings → Developer → ensure "Use the system authentication service to
-unlock" and the per-CLI-call biometric option are both on. op-forward only
-forces an interactive PTY; the desktop app decides whether to prompt.
+### Stale sockets and address in use
 
-### Daemon respawns in a tight loop
+- Host: `socket PATH is already in use by another daemon` means a daemon is
+  listening there, for example a launchd job and a manual `serve` configured
+  with the same path. Stop one. A socket that does not answer the daemon's probe
+  (for example one left by a daemon that was killed) is treated as stale and
+  replaced automatically.
+- Host: `PATH exists and is not a socket; refusing to replace it` means a regular
+  file or directory is at the path. Choose another path or remove the file
+  yourself.
+- Host: `socket directory ... is mode ...; it must be 0700` or `owned by uid`
+  means the parent directory is shared or belongs to another user. Use a private
+  directory such as `~/Library/Caches/op-forward`.
+- VM: `ssh -R` reports `Address already in use` for the socket path (this is
+  OpenSSH's error text, not an op-forward message). Set
+  `StreamLocalBindUnlink yes` on the VM's sshd, or delete the leftover socket file.
+- A bind failure for a long path includes a hint about the roughly 104-byte limit
+  on macOS; shorten the path.
 
-Inspect `~/Library/Logs/op-forward.log`. The most common cause is a
-permission problem on the token directory or socket parent directory after a
-manual `chown`/`chmod`; check that the user running launchd owns
-`~/Library/Caches/op-forward` and it is mode `0700`.
+### Shim falling back to the real op
 
-### `op-forward update` on a Homebrew-installed binary
+Symptom: `op` works but no Touch ID prompt appears, or it fails with a message from
+the local `op`. Every proxy exit of 127 makes the shim run the real `op` (see
+[protocol.md](protocol.md#exit-codes)). Run
+`op-forward proxy -- account list; echo "exit=$?"` to see the proxy's own message
+and status. Also confirm `command -v op` resolves to `~/.local/bin/op`, and that
+the shim's `OP_FORWARD_BIN` line names an executable file or that `op-forward` is
+on `PATH`.
 
-It will succeed but break `brew upgrade` semantics — Homebrew thinks the old
-version is installed. Either prefer `brew upgrade reishoku/tap/op-forward`,
-or re-link with `brew link --overwrite op-forward` if you have already
-self-updated.
+### 426 upgrade required
+
+Symptom: the proxy prints a JSON error saying the client version is below the
+minimum and exits 127. Update the remote binary through its package manager or
+`op-forward update`.
+
+### op not found on the host
+
+Symptom: `execution error: op CLI not found in PATH` with HTTP 500. The daemon
+could not find `op`. Under launchd the daemon's `PATH` is fixed in the plist (see
+[launchd service](#launchd-service)) and is not taken from your shell, so install
+or link `op` into one of the directories listed there.
+
+### Escape sequences in output
+
+`op` is run under a pseudo-terminal, so its output can contain ANSI color escape
+sequences that reach the remote caller unchanged. See
+[protocol.md](protocol.md#output-formatting).
+
+### Daemon did not come back after update
+
+`op-forward update` reports `daemon did not come back on ...`. Check the log,
+and restart with `launchctl kickstart -k gui/$(id -u)/com.op-forward.daemon`.
+Also confirm the `OP_FORWARD_LISTEN` or `OP_FORWARD_PORT` in the shell that ran
+`update` matches the service's endpoint.
 
 ## See also
 
-- [`cli.md`](cli.md) — what each subcommand does
-- [`configuration.md`](configuration.md) — every variable mentioned above
-- [`tokens.md`](tokens.md) — token deployment and rotation
-- [`transport.md`](transport.md) — socket and tunnel internals
-- [`security.md`](security.md) — what threats this configuration handles
+- [cli.md](cli.md) for command details
+- [transport.md](transport.md) for tunnel and socket rules
+- [tokens.md](tokens.md) for the token lifecycle
+- [security.md](security.md#hardening-checklist) for hardening guidance

@@ -1,0 +1,127 @@
+name: Report card
+
+on:
+  push:
+    branches: [reishoku]
+  pull_request:
+    branches: [reishoku]
+  schedule:
+    # Weekly, Monday 05:17 UTC, so newly published vulnerability data is
+    # reflected even when the repository has been quiet.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Tool versions are pinned here so a report is reproducible and tool updates
+# are deliberate, reviewed changes.
+env:
+  GOLANGCI_LINT_VERSION: v2.15.0
+  GOSEC_VERSION: v2.29.0
+  GOVULNCHECK_VERSION: v1.9.0
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install govulncheck
+        run: go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+
+      - name: Install golangci-lint
+        run: |
+          # Official release artifact, installed into the Go bin directory.
+          curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_LINT_VERSION}/install.sh" \
+            | sh -s -- -b "$(go env GOPATH)/bin" "${GOLANGCI_LINT_VERSION}"
+
+      - name: Install gosec
+        run: |
+          # Official release artifact, installed into the Go bin directory.
+          # Fetched at the version tag, not a moving branch, so the installer
+          # and the binary it fetches change only when the pin does.
+          curl -sSfL "https://raw.githubusercontent.com/securego/gosec/${GOSEC_VERSION}/install.sh" \
+            | sh -s -- -b "$(go env GOPATH)/bin" "${GOSEC_VERSION}"
+
+      - name: Add Go tools to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Generate the report card
+        run: scripts/build-report-card.sh report-out
+
+      - name: Gate on tests, reachable vulnerabilities, and coverage floors
+        env:
+          REPORT_CARD_BASELINE_URL: https://reishoku.github.io/fork.op-forward/report/coverage.json
+        run: scripts/build-report-card.sh --gate report-out
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: report-card
+          path: report-out/
+          retention-days: 30
+
+  # Publishing runs as its own job so the report job itself needs no write
+  # permission; fork pull requests therefore never execute with a writable
+  # token.
+  publish:
+    needs: report
+    if: github.event_name == 'push' && github.ref == 'refs/heads/reishoku'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Two pushes to reishoku in quick succession produce two publishes racing
+    # over the gh-pages ref; the loser's push is rejected with a ref-lock
+    # error (observed on the first day in production). Queue them instead.
+    concurrency:
+      group: gh-pages-publish
+      cancel-in-progress: false
+    steps:
+      - name: Download the report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: report-card
+          path: report-out
+
+      - name: Publish the report to gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The release workflow also writes to gh-pages (package
+          # repositories at the site root), so this step only touches
+          # /report. The report is a generated, latest-wins artifact: on a
+          # contested push the commit is rebuilt on top of the current
+          # remote tip and pushed again. Rebasing is deliberately avoided,
+          # because two publishes rewrite the same generated files and a
+          # rebase between them conflicts by construction.
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git init -q -b gh-pages /tmp/repo
+          git -C /tmp/repo remote add origin "$REMOTE"
+          git -C /tmp/repo config user.name "github-actions[bot]"
+          git -C /tmp/repo config user.email "github-actions[bot]@users.noreply.github.com"
+
+          for attempt in 1 2 3; do
+            if [ -n "$(git -C /tmp/repo ls-remote --heads origin gh-pages)" ]; then
+              git -C /tmp/repo fetch -q origin gh-pages
+              git -C /tmp/repo reset -q --hard origin/gh-pages
+            fi
+            mkdir -p /tmp/repo/report
+            cp report-out/index.html report-out/badge.json report-out/coverage.json /tmp/repo/report/
+            git -C /tmp/repo add -A
+            if git -C /tmp/repo diff --cached --quiet; then
+              echo "published report already matches; nothing to push"
+              exit 0
+            fi
+            git -C /tmp/repo commit -q -m "Update report card for ${GITHUB_SHA::7}"
+            if git -C /tmp/repo push origin HEAD:gh-pages; then
+              exit 0
+            fi
+            echo "push rejected (attempt ${attempt}); rebuilding on the new tip"
+          done
+          echo "could not push the report after 3 attempts" >&2
+          exit 1

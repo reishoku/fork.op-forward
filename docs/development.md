@@ -1,281 +1,313 @@
-# Development & release
+# Development
 
-This page covers how the codebase is built, tested, released, and how the
-fork's branch model relates to upstream.
+This page covers building and testing op-forward, the packaging pipeline, the
+package repositories, and the release and recovery workflows. The current release
+line is v1.x (latest tag v1.0.0).
 
-## Repository layout
+## Requirements
 
-```
-.
-├── cmd/                         # CLI subcommands; routing in cmd/root.go
-│   ├── install.go               # writes the bash op shim
-│   ├── proxy.go                 # the per-call client
-│   ├── proxy_test.go
-│   ├── root.go                  # subcommand dispatch + usage text
-│   ├── serve.go                 # daemon startup
-│   ├── service.go               # launchd plist install/uninstall (macOS only)
-│   └── update.go                # self-update from GitHub Releases
-├── internal/
-│   ├── auth/                    # token model and persistence
-│   │   ├── token.go
-│   │   └── token_test.go
-│   ├── daemon/                  # HTTP server, three handlers
-│   │   ├── server.go
-│   │   └── server_test.go
-│   ├── executor/                # request validation + PTY-based op execution
-│   │   ├── op.go
-│   │   ├── op_test.go
-│   │   ├── pty_darwin.go        # Darwin-specific termios + Setctty
-│   │   └── pty_linux.go         # Linux-specific termios + Setctty
-│   ├── transport/               # socket path + peer-credential extraction
-│   │   ├── peercred_darwin.go   # LOCAL_PEERCRED via Xucred
-│   │   ├── peercred_linux.go    # SO_PEERCRED via Ucred
-│   │   ├── peercred_other.go    # returns -1 (skip)
-│   │   └── socket.go            # SocketPath() resolution
-│   └── version/                 # semantic-version comparison
-│       ├── compare.go
-│       └── compare_test.go
-├── scripts/
-│   ├── build-apt-repo.sh        # APT Packages/Release index for gh-pages
-│   ├── build-deb.sh             # .deb assembly from the release tarballs
-│   └── install.sh               # one-shot installer (curl | sh)
-├── .github/workflows/
-│   ├── ci.yml                   # go vet + go test on push/PR to reishoku
-│   └── release.yml              # tag-triggered release pipeline
-├── docs/                        # this directory
-├── main.go                      # tiny shim that calls cmd.Execute
-├── go.mod                       # module = github.com/reishoku/fork.op-forward
-├── Makefile                     # build, build-all, test, clean
-├── README.md                    # quickstart + summary
-└── LICENSE                      # MIT
-```
-
-The package boundaries map cleanly to documentation pages:
-
-| Package         | Page |
-|-----------------|------|
-| `cmd/`          | [`cli.md`](cli.md) |
-| `internal/auth` | [`tokens.md`](tokens.md) |
-| `internal/daemon` | [`protocol.md`](protocol.md), [`architecture.md`](architecture.md) |
-| `internal/executor` | [`security.md`](security.md), [`architecture.md`](architecture.md) |
-| `internal/transport` | [`transport.md`](transport.md) |
-| `internal/version` | [`protocol.md` § Version negotiation](protocol.md#version-negotiation) |
-
-## Toolchain
-
-| Component | Version | Source of truth |
+| Tool | Needed for | Source of the requirement |
 |---|---|---|
-| Go         | `1.25.0`              | [`go.mod`](../go.mod) |
-| `creack/pty`        | `v1.1.24`     | [`go.mod`](../go.mod) |
-| `golang.org/x/sys`  | `v0.42.0`     | [`go.mod`](../go.mod) |
+| Go 1.27 | Building and testing | `go 1.27.0` in [go.mod](../go.mod); CI reads the version from it |
+| make | Convenience targets | [Makefile](../Makefile) |
+| nfpm 2.47.0 | Building Linux packages | Pinned and checksummed in [release.yml](../.github/workflows/release.yml) |
+| Docker | Package install tests, the Alpine repository, AUR verification | [scripts/test-packages.sh](../scripts/test-packages.sh), [scripts/build-apk-repo.sh](../scripts/build-apk-repo.sh), [scripts/build-aur.sh](../scripts/build-aur.sh) |
+| `dpkg-scanpackages`, `createrepo_c`, `gpg`, `gh` | Building the APT and RPM repositories and syncing releases | [scripts/](../scripts) |
 
-CI also drives `go-version-file: go.mod`, so the Go toolchain on the
-runner tracks the module declaration automatically.
+The module has two direct dependencies, `github.com/creack/pty` and
+`golang.org/x/sys`. The daemon and proxy support macOS and Linux: the executor
+has platform files for each ([pty_darwin.go](../internal/executor/pty_darwin.go),
+[pty_linux.go](../internal/executor/pty_linux.go)).
 
-## Building
+## Build and test
 
-The Makefile is the entry point.
-
+```bash
+make build                 # ./op-forward for this platform
+make build VERSION=1.0.0   # stamp a version
+make build-all VERSION=1.0.0
+make test
+make clean
 ```
-make build            # native build (current GOOS/GOARCH)
-make build-all        # cross-compile darwin/linux × arm64/amd64 + tar.gz
-make test             # go test ./...
-make clean            # rm -rf op-forward dist/
-```
 
-Notes on `make build`:
+- The Makefile's `VERSION` defaults to `0.3.0`, which does not track releases.
+  Pass `VERSION` explicitly. A plain `go build .` produces a binary that reports
+  `dev`.
+- The version is stamped with
+  `-ldflags "-X github.com/reishoku/fork.op-forward/cmd.Version=$VERSION"`.
+- `build-all` disables cgo and builds `darwin` and `linux` for `arm64` and
+  `amd64` into `dist/op-forward_<version>_<os>_<arch>/op-forward`, plus a
+  `.tar.gz` of each. With cgo off, the Linux binaries are static and run on
+  musl-based distributions.
 
-- Output binary is named `op-forward` in the repo root.
-- `LDFLAGS = -s -w -X github.com/reishoku/fork.op-forward/cmd.Version=$(VERSION)`.
-  `VERSION` defaults to `0.3.0` in the Makefile; override on the command
-  line for local snapshots: `make build VERSION=0.3.1-dev`.
-- `-s -w` strips the symbol table and DWARF; the binary drops from
-  ≈10 MB to ≈6 MB without affecting behaviour.
+Checks to run before submitting a change:
 
-For local development, `go run . version` is faster than going through
-`make` — but it reports `dev` because the ldflags are not set.
-
-## Testing
-
-```
+```bash
+gofmt -l .        # prints files that need formatting; should print nothing
+go vet ./...
 go test ./...
 ```
 
-The suite is hermetic — every test creates its own `t.TempDir` and
-`t.Setenv`s the relevant overrides (`OP_FORWARD_TOKEN_DIR`,
-`OP_FORWARD_TOKEN_FILE`, `XDG_STATE_HOME`). It does not start the daemon
-on the real default socket path, does not write to the user's real cache
-directory, and does not depend on `op` being installed.
+The CI workflow ([ci.yml](../.github/workflows/ci.yml)) runs `go vet ./...` and
+`go test ./...` on pushes and pull requests to `reishoku`. It does not run `gofmt`.
 
-What is covered:
+Test files sit beside the code they cover:
 
-- **`internal/auth`** — token generation, TTL math, save/load, atomic
-  write semantics, `OP_FORWARD_TOKEN_FILE`/`OP_FORWARD_TOKEN_DIR` precedence,
-  legacy migration, refresh-token uniqueness and rotation.
-- **`internal/daemon`** — handler authentication paths, peer-UID is *not*
-  exercised in unit tests (would require a real Unix socket); refresh
-  endpoint rotation; version-negotiation outcomes.
-- **`internal/executor`** — argument validation matrix (legitimate vs
-  shell-metachar vs blocked), PTY allocation, OPOST stripping.
-- **`internal/version`** — `Compare` with edge cases (`dev`, leading `v`,
-  multi-digit minor).
-- **`cmd`** — proxy token-path resolution under the various env-var
-  combinations.
+| Area | Tests |
+|---|---|
+| Endpoint parsing, loopback rule, Unix socket rules, peer uid | [internal/endpoint/](../internal/endpoint) |
+| Tokens, file format, migration | [internal/auth/token_test.go](../internal/auth/token_test.go) |
+| Daemon routes, auth, refresh, peer middleware, Unix serving | [internal/daemon/](../internal/daemon) |
+| Validation, blocklist, PTY behavior | [internal/executor/op_test.go](../internal/executor/op_test.go) |
+| Version comparison | [internal/version/compare_test.go](../internal/version/compare_test.go) |
+| Flag precedence, shim fallback, plist rendering, update wait | [cmd/](../cmd) |
 
-`go vet ./...` runs in CI; treat its output as a build error.
+## Packaging
 
-The PTY tests in [`internal/executor/op_test.go`](../internal/executor/op_test.go)
-do require a working PTY subsystem. They run on both macOS and Linux CI
-runners.
+### nfpm definition
 
-## CI
+[nfpm.yaml](../nfpm.yaml) defines one package for every Linux format. It reads
+`ARCH` and `VERSION` from the environment. It installs the binary to
+`/usr/bin/op-forward` (mode 0755) and the license to each format's conventional
+location, and runs [scripts/pkg/postinstall.sh](../scripts/pkg/postinstall.sh).
+RPM packages are signed with the key in `NFPM_RPM_KEY_FILE`, and Alpine packages
+with the RSA key in `NFPM_APK_KEY_FILE` (key name `op-forward`); an empty value
+produces an unsigned package. The packages declare no dependencies.
 
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs on push and
-pull requests against `reishoku`:
+Packages use `/usr/bin` because distribution policy reserves `/usr/local` for the
+administrator. Releases up to 0.7.1 installed to `/usr/local/bin`, and the shim
+written by those releases records that path. The post-install script rewrites the
+recorded path in shims it finds under `/home/*/.local/bin/op` and
+`/root/.local/bin/op`, identified by the header line `# op-forward shim`,
+keeping ownership and mode.
 
-```yaml
-on:
-  push:
-    branches: [reishoku]
-  pull_request:
-    branches: [reishoku]
+### Building packages
+
+```bash
+make build-all VERSION=1.0.0
+scripts/build-packages.sh 1.0.0 dist pkg-out
 ```
 
-The job is `ubuntu-latest`, checks out, sets up Go from `go.mod`, and runs
-`go vet ./...` followed by `go test ./...`. There is no separate macOS leg
-in CI today; macOS-specific code paths are exercised at release time when
-the cross-compile leg builds the Darwin binaries (the build itself
-type-checks them).
+[scripts/build-packages.sh](../scripts/build-packages.sh) takes the version, the
+directory holding `op-forward_<version>_linux_<arch>/op-forward` binaries, and an
+output directory. For `amd64` and `arm64` it stages the binary at
+`build/op-forward` (the fixed path `nfpm.yaml` references) and runs `nfpm package`
+for each of `deb`, `rpm`, `apk`, and `archlinux`. Output names:
 
-## Release pipeline
+| Format | File name |
+|---|---|
+| Debian | `op-forward_<version>_<arch>.deb` (amd64, arm64) |
+| RPM | `op-forward-<version>-1.<rpmarch>.rpm` (x86_64, aarch64) |
+| Alpine | `op-forward_<version>_<rpmarch>.apk` |
+| Arch | `op-forward-<version>-1-<archarch>.pkg.tar.zst` |
 
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) runs on
-tag push (`v*`). It does the following, in order:
+### Testing packages
 
-1. **Test gate** — repeat `go test ./...` on the tagged commit.
-2. **Cross-compile** — builds `op-forward_<version>_<os>_<arch>` for
-   `darwin/{amd64,arm64}` and `linux/{amd64,arm64}`. Each artifact is
-   tarred to `dist/<name>.tar.gz` with the binary at the archive root.
-3. **GitHub Release** — `gh release create` against the pushed tag,
-   attaching all four tarballs and using `--generate-notes` for the body.
-4. **Homebrew tap** — generates a fresh `op-forward.rb` with the four SHA
-   digests, pushes it to `reishoku/homebrew-tap/Formula/op-forward.rb`. The
-   formula's `bin.install "op-forward"` is the only install step; `test`
-   asserts that `op-forward version` contains the version string.
-5. **`.deb` packages** — `scripts/build-deb.sh` produces architecture-specific
-   `.deb`s under `deb-out/`. The package name is `op-forward`, version is the
-   release version, the binary lands at `/usr/local/bin/op-forward`.
-6. **APT repository** — `scripts/build-apt-repo.sh` builds (or rebuilds) the
-   APT metadata under `dists/stable/main/binary-{amd64,arm64}/Packages` and
-   commits the result to the `gh-pages` branch. If `APT_GPG_PRIVATE_KEY`
-   and `APT_GPG_KEY_ID` secrets are present, the `Release` file is signed
-   (producing `Release.gpg` and `InRelease`) and the public key is exported
-   to `key.gpg`. The `gh-pages` branch is what serves
-   `https://reishoku.github.io/fork.op-forward`.
+```bash
+scripts/test-packages.sh 1.0.0 pkg-out [arch]
+```
 
-The release pipeline depends on these secrets:
+[scripts/test-packages.sh](../scripts/test-packages.sh) is the acceptance test. For
+Debian (`debian:bookworm-slim`), Fedora (`fedora:latest`), Alpine
+(`alpine:latest`), and, on amd64 only, Arch Linux, it starts a container, installs
+the package, checks that `/usr/bin/op-forward` is executable and that
+`op-forward version` contains the version, and then runs the pre-0.7.2 shim check:
+the container begins with a shim that records `/usr/local/bin/op-forward`, and
+after installation that shim must reach the packaged binary (the proxy exits 127
+because no daemon or tokens exist) and its owner must be unchanged. Signatures
+are bypassed in this test; it covers file layout, the post-install script, and the
+binary.
 
-| Secret                  | Purpose |
-|-------------------------|---------|
-| `GITHUB_TOKEN`          | Default, sufficient for `gh release create` and `gh-pages` push. |
-| `HOMEBREW_TAP_TOKEN`    | Token with `contents: write` on `reishoku/homebrew-tap`. |
-| `APT_GPG_PRIVATE_KEY`   | ASCII-armored private key for signing the APT `Release`. Optional but recommended. |
-| `APT_GPG_KEY_ID`        | Fingerprint of the above. |
+## Package repositories
 
-If the GPG secrets are absent, the APT repo is published unsigned and
-clients need `[trusted=yes]` in their sources.list. The recommended path is
-to set both secrets so the repo is signed end-to-end.
+The repositories are static files on the `gh-pages` branch, served by GitHub
+Pages at `https://reishoku.github.io/fork.op-forward`.
+
+### Published layout
+
+| Path | Repository | Contents |
+|---|---|---|
+| `/` | APT | `dists/stable/main/binary-{amd64,arm64}/Packages{,.gz}`, `dists/stable/Release`, `InRelease`, `Release.gpg`, `pool/*.deb`, `key.gpg` |
+| `/rpm` | dnf, yum, zypper | `rpm/<arch>/*.rpm`, `rpm/<arch>/repodata/` (plus `repomd.xml.asc` when signed), `rpm/op-forward.repo` |
+| `/apk` | apk | `apk/<arch>/*.apk`, `apk/<arch>/APKINDEX.tar.gz`, `apk/op-forward.rsa.pub` |
+| `/index.html` | Landing page | Install commands for every repository |
+
+### Building the repositories
+
+[scripts/build-repositories.sh](../scripts/build-repositories.sh)
+`<repo-dir> <base-url> [repo-slug]` is the single entry point. It runs, in order:
+
+1. [sync-release-packages.sh](../scripts/sync-release-packages.sh): populates the
+   tree from the packages attached to the project's GitHub releases (see
+   [Recovery](#recovery)).
+2. [build-apt-repo.sh](../scripts/build-apt-repo.sh): runs
+   `dpkg-scanpackages --multiversion` for each architecture over `pool/`,
+   compresses the index, writes `Release` with MD5 and SHA-256 sums, and, when
+   `GPG_KEY_ID` is set, produces `Release.gpg`, `InRelease`, and `key.gpg`. The
+   `--multiversion` flag matters: without it `dpkg-scanpackages` lists only the
+   newest version of each package, which makes older versions in the pool
+   unreachable. Without a key the metadata is unsigned.
+3. [build-rpm-repo.sh](../scripts/build-rpm-repo.sh): runs `createrepo_c --update`
+   for `x86_64` and `aarch64`, signs `repomd.xml` when a key is set, and writes
+   `op-forward.repo` with `gpgcheck` and `repo_gpgcheck` enabled only if signed.
+4. [build-apk-repo.sh](../scripts/build-apk-repo.sh): only when
+   `NFPM_APK_KEY_FILE` is set. Inside an Alpine container it exports the public
+   key, renames each package to `<pkgname>-<pkgver>.apk`, builds the index, and
+   signs it.
+5. Writes `index.html`.
+
+Environment: `GH_TOKEN` (required), `GPG_KEY_ID`, `NFPM_APK_KEY_FILE`.
+
+### Recovery
+
+The `gh-pages` branch is derived data. Everything on it comes from artifacts
+attached to the GitHub releases, so a branch that was deleted, truncated, or never
+created can be rebuilt.
+
+- `sync-release-packages.sh <repo-dir> [slug]` lists up to 200 releases with
+  `gh release list`, and downloads each `.deb`, `.rpm`, and `.apk` asset that is
+  not already present into `pool/`, `rpm/<arch>/`, or `apk/<arch>/`. Downloads go
+  to a scratch area first and move into place only when complete; a failed
+  download is reported and skipped. Existing files are left alone.
+- [scripts/ensure-pages.sh](../scripts/ensure-pages.sh) `<owner/repo>` checks the
+  repository's Pages configuration through the GitHub API. If the site already
+  serves `gh-pages` from `/`, it does nothing. If the site is missing or serves
+  something else, it tries to create or repoint it, and if the token lacks
+  administration rights it fails with instructions (a one-time `gh api -X POST`
+  command, or Settings, Pages, Source). The step exists because a pushed branch
+  that Pages is not serving answers 404 with nothing in the logs.
+
+The [republish workflow](#republish-workflow) runs the whole recovery on demand.
+
+## AUR package
+
+[scripts/build-aur.sh](../scripts/build-aur.sh) `<version> <out-dir> [--verify]`
+writes a `PKGBUILD` for `op-forward-bin` that installs the static release tarballs
+(x86_64 and aarch64) and the license, with SHA-256 sums computed from the
+published release assets, then generates `.SRCINFO` with `makepkg` in an Arch
+container. `--verify` additionally builds and installs the package in an
+`archlinux` container on `linux/amd64`. The release must already be published
+when this runs, because the checksums are read from it.
+
+## Release workflow
+
+[.github/workflows/release.yml](../.github/workflows/release.yml) runs on a
+pushed tag matching `v*` and on manual dispatch (the dry run). Jobs:
+
+1. `test`: `go test ./...`.
+2. `release` (after `test`):
+   1. Resolve the version: the tag name without `v`, or the dispatch input.
+   2. Build binaries for linux and darwin on amd64 and arm64 with cgo disabled,
+      `-trimpath`, and the version stamp; archive each as `op-forward_<version>_<os>_<arch>.tar.gz`.
+   3. Fail unless every Linux binary is reported by `file` as statically linked.
+   4. Create the GitHub release with the tarballs and generated notes.
+   5. Generate the Homebrew formula with the new version and the four checksums,
+      and push it to the project's tap repository when the `HOMEBREW_TAP_TOKEN`
+      secret is configured; otherwise skip the push with a notice.
+   6. Import signing keys: one PGP key for APT metadata, RPM packages, and RPM
+      metadata, and an RSA key for Alpine (without it, Alpine packages are
+      unsigned and the Alpine repository is not published).
+   7. Install nfpm from its release tarball with a pinned checksum and run
+      `scripts/build-packages.sh`.
+   8. Run `scripts/test-packages.sh` for `amd64`.
+   9. Attach the packages to the release.
+   10. Generate the AUR definition and verify it; push it to the AUR when an AUR
+       SSH key secret is configured, otherwise keep the generated files.
+   11. Publish the package repositories: clone `gh-pages` (or initialize an empty
+       branch if it does not exist), copy the new packages in, run
+       `build-repositories.sh`, commit, and push.
+   12. Run `ensure-pages.sh`.
+
+The `gh-pages` existence check uses a command substitution on `git ls-remote`
+rather than `ls-remote | grep -q`. The pipe form can die of SIGPIPE under
+`pipefail` and be read as "branch missing", which would reinitialize the branch
+and discard the pool; the comment in the workflow explains the case.
+
+Secrets used: `GITHUB_TOKEN`, `HOMEBREW_TAP_TOKEN`, `APT_GPG_PRIVATE_KEY`,
+`APT_GPG_KEY_ID`, `APK_RSA_PRIVATE_KEY`, and `AUR_SSH_PRIVATE_KEY`.
+
+### Dry run
+
+Dispatching the workflow manually asks for a version (default `0.0.0`); no tag is
+created. A dry run uses the real signing secrets and performs steps 1 through 3
+and 6 through 8 and the repository generation of step 11, but skips: creating
+the release, the Homebrew update, attaching packages, the AUR step, the push to
+`gh-pages`, and `ensure-pages.sh`. Packages and the generated repository tree
+(excluding `.git`) are uploaded as the artifact `dry-run-<version>` with seven-day
+retention. Because the repository step syncs from published releases, the dry run
+exercises that path against the real release list.
+
+## Republish workflow
+
+[.github/workflows/republish-repositories.yml](../.github/workflows/republish-repositories.yml)
+rebuilds the published repositories from the packages already attached to the
+releases, without cutting a version. It runs on manual dispatch and requires the
+input `confirm` to be exactly `republish`. Steps:
+
+1. Check the confirmation.
+2. Import signing keys. It stops if the PGP key is missing, because unsigned
+   metadata would make existing installations reject the repository. The Alpine
+   key is optional.
+3. Clone `gh-pages` (or initialize it), then run `build-repositories.sh`, which
+   syncs from the releases and regenerates every index.
+4. Verify the APT metadata: `Release`, `InRelease`, and `key.gpg` must be
+   non-empty, and the `amd64` and `arm64` `Packages` files must each list at least
+   one package.
+5. Commit and push `gh-pages`.
+6. Run `ensure-pages.sh`, which is also how a disabled Pages site is detected.
+
+Use it after a deleted or damaged `gh-pages` branch, a Pages site that was turned
+off, or an index that omits published versions.
+
+## Versioning and tagging
+
+Releases are tags of the form `vMAJOR.MINOR.PATCH` (upstream tags `v0.7.0` through
+`v0.7.3` exist at this writing). Pushing the tag starts the release workflow, and
+the tag without its `v` is stamped into the binaries and used in package versions.
+Use plain numeric tags. The daemon's comparison ignores a SemVer suffix (see
+[protocol.md](protocol.md#version-negotiation)), but the packaging does not
+tolerate one: nfpm turns `0.7.3-x.1` into `0.7.3~x.1`, which dpkg and rpm sort
+below `0.7.3`; makepkg rejects a hyphen in `pkgver`; apk rejects both `-` and
+`+` suffixes; the Arch package drops the suffix; and
+[scripts/test-packages.sh](../scripts/test-packages.sh) builds file names from
+the raw version.
+
+Fork releases use plain `X.Y.Z` tags in a series that does not collide with
+upstream's tags, so a fork release never shares a tag with a different upstream
+release. The series is chosen at the first fork release, and the release notes
+name the upstream version each fork release is based on. Raising the minimum
+accepted client version is a source change to `MinClientVersion` in
+[internal/daemon/server.go](../internal/daemon/server.go).
 
 ## Branch model
 
 This is a fork. The conventions:
 
-- **`reishoku`** is the active branch and the GitHub default. CI runs
-  against it; releases are tagged on it.
-- **`main`** tracks upstream `ekovshilovsky/op-forward`. Do not commit to
-  `main` directly; it exists to resolve diffs from upstream.
+- **`reishoku`** is the active branch, the GitHub default, and the base
+  branch for every PR. CI runs against it; releases are tagged on it.
+- Upstream is not mirrored into a branch of this repository. Add it as a
+  remote (`git remote add upstream https://github.com/ekovshilovsky/op-forward`),
+  merge `upstream/main` into a topic branch, and open a PR against `reishoku`
+  that is merged with a merge commit, so upstream stays an ancestor and the
+  next sync carries only the new diff.
 - Topic branches (`docs/...`, `feat/...`, `fix/...`) merge into
   `reishoku` via PR.
 - Releases are tagged `v<x>.<y>.<z>` on the `reishoku` branch.
 
-The fork-specific changes against upstream `main` are:
+Upstream adopted the fork's Unix socket transport, peer-credential check,
+probe-timeout fix, and token-path consolidation into `internal/endpoint`. What
+remains different from upstream `main`:
 
-| PR | Title | Effect |
-|----|-------|--------|
-| #1 | Switch transport to Unix domain socket with peer-credential enforcement | Replaces loopback TCP with HTTP-over-Unix-socket; adds `internal/transport`; tightens token persistence with `os.Root`. See [`transport.md`](transport.md). |
-| #3 | Update fork repository references | Changes `ekovshilovsky/op-forward` → `reishoku/fork.op-forward` throughout (badges, releases, install script, Homebrew tap, APT repo, Go module path). |
-
-These two PRs are the entirety of the fork's divergence from upstream as of
-this writing. Anything else is unchanged from upstream.
-
-## Local development workflow
-
-A typical iteration:
-
-```bash
-# Pull and rebase on the active branch
-git checkout reishoku
-git pull --rebase origin reishoku
-
-# Branch
-git checkout -b feat/<short-description>
-
-# Code, test, repeat
-go test ./...
-make build VERSION=local-dev
-./op-forward version
-
-# Push and PR
-git push -u origin feat/<short-description>
-gh pr create --base reishoku --assignee reishoku
-```
-
-Open PRs against `reishoku`, not `main`. Set `assignee: reishoku` on every
-PR and Issue (project rule).
-
-## Cutting a release
-
-1. Land all desired changes on `reishoku`.
-2. Update `Makefile`'s `VERSION` to the new value (purely cosmetic — the
-   release workflow uses the tag).
-3. Tag and push:
-   ```bash
-   git tag -s v<x>.<y>.<z> -m "v<x>.<y>.<z>"
-   git push origin v<x>.<y>.<z>
-   ```
-4. Watch the run at <https://github.com/reishoku/fork.op-forward/actions>.
-5. Verify:
-   - The release page lists four tarballs.
-   - `brew install reishoku/tap/op-forward` picks up the new version.
-   - `apt-get update && apt-cache policy op-forward` from a Debian/Ubuntu
-     box shows the new version.
-   - The Dependabot/automation noise has settled.
-
-If the release workflow fails partway, prefer to roll forward (push a
-`v<x>.<y>.<z+1>` tag) over recovering a half-published release.
-
-## Adding a new endpoint
-
-The minimum viable change to add an HTTP endpoint:
-
-1. Implement the handler in [`internal/daemon/server.go`](../internal/daemon/server.go).
-   Decide explicitly whether peer-UID is required and which token (access or
-   refresh) authenticates it.
-2. Register it in `Server.Start`'s `mux.HandleFunc`.
-3. Add a request flow to [`cmd/proxy.go`](../cmd/proxy.go) if the proxy
-   needs to call it; otherwise document that callers must use `curl
-   --unix-socket` directly.
-4. Add tests to
-   [`internal/daemon/server_test.go`](../internal/daemon/server_test.go),
-   covering the no-auth, wrong-method, and wrong-token cases at minimum.
-5. Update [`protocol.md`](protocol.md) — every wire-visible behaviour must
-   be documented before merge.
-6. If the change is breaking, bump `MinClientVersion` in the same PR. See
-   [`protocol.md` § Version negotiation](protocol.md#version-negotiation).
+| Area | Fork behavior | Where |
+|---|---|---|
+| Default endpoint | Unix socket at `endpoint.DefaultSocketPath` (`OP_FORWARD_SOCKET_PATH`, `$XDG_RUNTIME_DIR`, or the cache directory) on both sides; TCP only when `--port`/`--host`, `OP_FORWARD_PORT`/`OP_FORWARD_HOST`, or a `tcp://` endpoint is given. Upstream defaults to `tcp://127.0.0.1:18340` | [internal/endpoint/config.go](../internal/endpoint/config.go), [cmd/config.go](../cmd/config.go) |
+| Token directory | `$XDG_STATE_HOME/op-forward` is preferred over the cache directory when `XDG_STATE_HOME` is set | [internal/auth/token.go](../internal/auth/token.go) |
+| Token file I/O | Reads and writes go through `os.Root` confined to the token file's directory | [internal/auth/token.go](../internal/auth/token.go) |
+| Workflow actions | Every `uses:` is pinned to a full commit SHA with the release tag in a comment, because the fork's Actions policy rejects tag references; upstream uses major tags (`@v6`) | [.github/workflows/](../.github/workflows) |
+| Repository references | `ekovshilovsky/op-forward` → `reishoku/fork.op-forward` (Go module path, badges, releases, install script, Homebrew tap, package repositories on Pages, AUR source URLs); maintainer and security-contact references are unchanged | throughout |
 
 ## See also
 
-- [`architecture.md`](architecture.md) — what each package does
-- [`protocol.md`](protocol.md) — wire-visible contract
-- [`cli.md`](cli.md) — what each subcommand does
-- Upstream: <https://github.com/ekovshilovsky/op-forward>
+- [architecture.md](architecture.md) for the code layout
+- [deployment.md](deployment.md) for how users install the packages
+- [cli.md](cli.md#update) for the self-update command
+- [configuration.md](configuration.md#build-time-values) for build-time values
