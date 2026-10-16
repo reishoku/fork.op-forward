@@ -10,7 +10,7 @@ details are in [cli.md](cli.md); variables are in
 | Topology | Transport | Section |
 |---|---|---|
 | VM or server reached over SSH, forwarded port | TCP | [TCP port](#tcp-port) |
-| VM or server reached over SSH, forwarded socket | Unix socket | [Unix socket](#unix-socket) |
+| VM or server reached over SSH, forwarded socket | Unix socket | [Unix socket](#unix-socket-default) |
 | Colima or Lima VM | TCP or Unix socket over the VM's SSH config | [Colima and Lima](#colima-and-lima) |
 | Docker Desktop container | TCP to `host.docker.internal` | [Docker Desktop containers](#docker-desktop-containers) |
 

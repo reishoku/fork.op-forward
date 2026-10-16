@@ -45,10 +45,20 @@ Checks to run before submitting a change:
 gofmt -l .        # prints files that need formatting; should print nothing
 go vet ./...
 go test ./...
+go run scripts/check-docs.go   # or: make check-docs
 ```
 
-The CI workflow ([ci.yml](../.github/workflows/ci.yml)) runs `go vet ./...` and
-`go test ./...` on pushes and pull requests to `reishoku`. It does not run `gofmt`.
+The CI workflow ([ci.yml](../.github/workflows/ci.yml)) runs `go vet ./...`,
+`go test ./...`, and `go run scripts/check-docs.go` on pushes and pull requests
+to `reishoku`. It does not run `gofmt`.
+
+[scripts/check-docs.go](../scripts/check-docs.go) fails when the Markdown
+documentation refers to something that no longer exists: a relative link or
+its `#anchor`, a repository path in a code span (such as
+`internal/auth/token.go`), or a Go identifier of this module written as
+`package.Name` or `Type.Method` (such as `endpoint.DefaultSocketPath`). It
+does not fetch external URLs. Writing references in those forms keeps them
+checked; prose describing behavior still has to be kept accurate by hand.
 
 Test files sit beside the code they cover:
 
