@@ -1,0 +1,10 @@
+{
+  "total": 97.8,
+  "cmd": 99.1,
+  "internal/auth": 98.1,
+  "internal/daemon": 96.0,
+  "internal/endpoint": 94.5,
+  "internal/executor": 98.0,
+  "internal/version": 100.0,
+  "main": 88.9
+}
